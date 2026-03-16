@@ -80,6 +80,8 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
 
     30 days = ~43 200 minute candles = ~432 requests at 100/request.
 
+    Uses subprocess curl for HTTP requests (reliable in all environments).
+
     Args:
         days: Number of historical days to download (default 30)
 
@@ -93,6 +95,7 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
             return json.load(f)
 
     import random
+    import subprocess
 
     OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
     INST_ID = "BTC-USDT-SWAP"
@@ -103,67 +106,70 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
 
     logger.info(f"Downloading {days} days of BTC 1m candles from OKX REST API...")
 
-    minute_candles: List[dict] = []  # {"ts": int_ms, "open": float, "close": float}
-    after_ms: Optional[int] = None   # pagination cursor
+    def _fetch_candles(after_ms: Optional[int] = None) -> dict:
+        """Fetch one page of candles via curl subprocess."""
+        url = (
+            f"{OKX_CANDLES_URL}?instId={INST_ID}&bar=1m&limit={LIMIT}"
+        )
+        if after_ms is not None:
+            url += f"&after={after_ms}"
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "15", url],
+            capture_output=True, text=True, timeout=20,
+        )
+        return json.loads(result.stdout)
+
+    minute_candles: List[dict] = []
+    after_ms: Optional[int] = None
     batch: int = 0
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            params: dict = {
-                "instId": INST_ID,
-                "bar": "1m",
-                "limit": str(LIMIT),
-            }
-            if after_ms is not None:
-                params["after"] = str(after_ms)
+    while True:
+        retries: int = 0
+        payload: Optional[dict] = None
+        while retries <= 8:
+            try:
+                payload = await asyncio.get_event_loop().run_in_executor(
+                    None, _fetch_candles, after_ms
+                )
+                break
+            except Exception as e:
+                retries += 1
+                delay = min(2.0 * (2 ** retries), 30.0)
+                logger.warning(f"OKX fetch error (retry {retries}): {e}, wait {delay:.0f}s")
+                await asyncio.sleep(delay)
 
-            retries: int = 0
-            while True:
-                try:
-                    async with session.get(
-                        OKX_CANDLES_URL,
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as resp:
-                        resp.raise_for_status()
-                        payload = await resp.json()
-                    break
-                except Exception as e:
-                    retries += 1
-                    if retries > 8:
-                        raise
-                    delay = min(2.0 * (2 ** retries), 30.0)
-                    logger.warning(f"OKX fetch error (retry {retries}): {e}, wait {delay:.0f}s")
-                    await asyncio.sleep(delay)
+        if payload is None:
+            raise RuntimeError("OKX download failed after max retries")
 
-            data = payload.get("data", [])
-            if not data:
-                break  # no more candles
+        data = payload.get("data", [])
+        if not data:
+            break  # no more candles
 
-            # OKX returns newest-first; each row: [ts, open, high, low, close, vol, ...]
-            for row in data:
-                ts = int(row[0])
-                if ts < cutoff_ms:
-                    # Reached our target lookback — stop
-                    minute_candles.sort(key=lambda c: c["ts"])
-                    break
-                minute_candles.append({
-                    "ts": ts,
-                    "open": float(row[1]),
-                    "close": float(row[4]),
-                })
-            else:
-                # All rows in this batch were within range — keep paginating
-                after_ms = int(data[-1][0])  # oldest ts in this batch
-                batch += 1
-                if batch % 50 == 0:
-                    pct = max(0.0, (now_ms - after_ms) / (now_ms - cutoff_ms) * 100)
-                    logger.info(
-                        f"OKX download: {pct:.0f}% ({len(minute_candles):,} candles)"
-                    )
-                await asyncio.sleep(0.12)  # ~8 req/s, stay under rate limit
-                continue
-            break  # inner break was hit
+        # OKX returns newest-first; each row: [ts, open, high, low, close, vol, ...]
+        reached_cutoff = False
+        for row in data:
+            ts = int(row[0])
+            if ts < cutoff_ms:
+                reached_cutoff = True
+                break
+            minute_candles.append({
+                "ts": ts,
+                "open": float(row[1]),
+                "close": float(row[4]),
+            })
+
+        if reached_cutoff:
+            break
+
+        # Paginate backwards — oldest ts in this batch
+        after_ms = int(data[-1][0])
+        batch += 1
+        if batch % 50 == 0:
+            pct = max(0.0, (now_ms - after_ms) / (now_ms - cutoff_ms) * 100)
+            logger.info(
+                f"OKX download: {pct:.0f}% ({len(minute_candles):,} candles)"
+            )
+        await asyncio.sleep(0.12)  # ~8 req/s, stay under rate limit
 
     minute_candles.sort(key=lambda c: c["ts"])
     logger.info(f"Downloaded {len(minute_candles):,} 1-minute candles from OKX")

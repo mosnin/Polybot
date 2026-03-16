@@ -120,6 +120,11 @@ class Config:
     # fill probability while still qualifying as passive maker orders.
     rebate_price_offset: float = 0.005
 
+    # --- Backtesting ---
+    # Number of days of historical 1-second BTC ticks to download for backtesting.
+    # 30 days provides ~8,600 five-minute windows for statistically meaningful results.
+    historical_data_days: int = 30
+
     # --- Polygon Contract Addresses ---
     # USDC.e (bridged) on Polygon — primary collateral for all Polymarket trading.
     # 6 decimals: 1 USDC = 1_000_000 wei units.

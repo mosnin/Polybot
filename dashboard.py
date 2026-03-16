@@ -276,6 +276,153 @@ def render_trade_table(trades: List[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _render_backtest_tab() -> None:
+    """Render the Backtest validation tab.
+
+    Provides a one-click "Run Backtest" button that downloads historical data,
+    replays every 5-minute window through the full pipeline, and displays
+    comprehensive results with auto-alerts for degraded performance.
+    """
+    import streamlit as st
+
+    st.subheader("Strategy Validation — Deep Backtest")
+    st.caption(
+        "Downloads 30 days of 1-second BTC ticks and replays every 5-minute window "
+        "through the full Bayesian + z-score + Monte Carlo pipeline. "
+        "Proves the strategy is winning before any live capital is risked."
+    )
+
+    # Initialize backtest state
+    if "backtest_result" not in st.session_state:
+        st.session_state.backtest_result = None
+    if "backtest_running" not in st.session_state:
+        st.session_state.backtest_running = False
+
+    # Run Backtest button
+    if st.button(
+        "Run Backtest",
+        type="primary",
+        use_container_width=True,
+        disabled=st.session_state.backtest_running,
+    ):
+        st.session_state.backtest_running = True
+        st.session_state.backtest_result = None
+
+        progress_bar = st.progress(0.0, text="Downloading historical data...")
+        status_text = st.empty()
+
+        def update_progress(pct: float) -> None:
+            progress_bar.progress(
+                min(pct, 1.0),
+                text=f"Simulating windows... {pct * 100:.0f}%",
+            )
+
+        try:
+            import asyncio as _asyncio
+
+            from backtest import run_backtest
+            from config import load_config
+
+            config = load_config()
+            status_text.info(
+                f"Backtesting {config.historical_data_days} days of data..."
+            )
+            result = _asyncio.run(run_backtest(config, progress_callback=update_progress))
+            st.session_state.backtest_result = result
+            progress_bar.progress(1.0, text="Backtest complete!")
+            status_text.empty()
+        except Exception as e:
+            st.error(f"Backtest failed: {e}")
+        finally:
+            st.session_state.backtest_running = False
+
+    # Display results if available
+    result = st.session_state.backtest_result
+    if result is None:
+        st.info("Click 'Run Backtest' to validate strategy on historical data.")
+        return
+
+    # --- Alert Banners ---
+    if result.get("alert_win_rate"):
+        st.error(
+            f"ALERT: Win rate {result['win_rate']:.1%} is below the 58% minimum threshold. "
+            "Model parameters may need adjustment before live deployment."
+        )
+    if result.get("alert_expectancy"):
+        st.error(
+            f"ALERT: Daily expectancy {result['daily_expectancy']:.2%} is below the 0.8% minimum. "
+            "Strategy may not cover fees/gas in live trading."
+        )
+
+    # --- Verdict ---
+    if not result.get("alert_win_rate") and not result.get("alert_expectancy"):
+        st.success(
+            "STRATEGY VALIDATED — Win rate and expectancy confirm "
+            "positive edge. Ready for live deployment."
+        )
+    elif result.get("total_trades", 0) == 0:
+        st.warning("No trades generated. Model thresholds may be too strict.")
+
+    # --- Metric Cards ---
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Trades", f"{result.get('total_trades', 0):,}")
+        st.metric("Wins / Losses", f"{result.get('wins', 0)} / {result.get('losses', 0)}")
+    with col2:
+        st.metric("Win Rate", f"{result.get('win_rate', 0):.1%}")
+        st.metric("Avg Edge", f"{result.get('avg_edge', 0):.4f}")
+    with col3:
+        st.metric("Sharpe Ratio", f"{result.get('sharpe_ratio', 0):.2f}")
+        st.metric("Max Drawdown", f"{result.get('max_drawdown', 0):.1%}")
+
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        st.metric("Net Return", f"{result.get('net_return', 0):.1%}")
+    with col5:
+        st.metric("Final Balance", f"${result.get('final_balance', 0):.2f}")
+    with col6:
+        st.metric("Daily Expectancy", f"{result.get('daily_expectancy', 0):.2%}")
+
+    # --- Backtest Equity Curve ---
+    bt_equity: list = result.get("equity_curve", [])
+    if len(bt_equity) >= 2:
+        st.markdown("---")
+        st.subheader("Backtest Equity Curve")
+        fig: plt.Figure = render_equity_curve(bt_equity)
+        st.pyplot(fig)
+        plt.close(fig)
+
+    # --- Trade Log (first 100 trades) ---
+    bt_trades: list = result.get("trades", [])
+    if bt_trades:
+        st.markdown("---")
+        st.subheader(f"Trade Log (showing {min(len(bt_trades), 100)} of {len(bt_trades)})")
+
+        log_rows: list = []
+        for t in bt_trades[:100]:
+            log_rows.append({
+                "Time": datetime.datetime.fromtimestamp(
+                    t.get("timestamp", 0) / 1000.0
+                ).strftime("%Y-%m-%d %H:%M"),
+                "Direction": t.get("direction", "—"),
+                "Edge": f"{t.get('edge', 0):.4f}",
+                "Kelly": f"{t.get('kelly_fraction', 0):.3f}",
+                "Entry": f"${t.get('entry_price', 0):,.2f}",
+                "Exit": f"${t.get('exit_price', 0):,.2f}",
+                "Won": "Yes" if t.get("won") else "No",
+                "P&L": f"${t.get('pnl', 0):+.4f}",
+                "Balance": f"${t.get('balance_after', 0):.2f}",
+            })
+        st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+
+    # --- Windows Summary ---
+    st.caption(
+        f"Analyzed {result.get('total_windows', 0):,} five-minute windows | "
+        f"Avg Kelly: {result.get('avg_kelly', 0):.3f}"
+    )
+
+
 def main_page() -> None:
     """Streamlit page layout — the complete dashboard UI.
 
@@ -304,58 +451,67 @@ def main_page() -> None:
     if state.is_paused:
         st.warning("Bot is PAUSED")
 
-    # --- Row 1: Summary Metric Cards ---
-    summaries: Dict[str, str] = compute_summaries(state)
+    # --- Tabbed Layout ---
+    tab_live, tab_backtest = st.tabs(["Live Trading", "Backtest"])
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            label="USDC Balance",
-            value=f"${state.balance:.2f}",
-        )
-    with col2:
-        st.metric(label="24h Win Rate", value=summaries["24h Win Rate"])
-    with col3:
-        st.metric(label="Max Drawdown", value=summaries["Max Drawdown"])
-    with col4:
-        st.metric(label="Avg Latency", value=summaries["Avg Latency"])
+    # === LIVE TRADING TAB ===
+    with tab_live:
+        # --- Row 1: Summary Metric Cards ---
+        summaries: Dict[str, str] = compute_summaries(state)
 
-    # Secondary metrics row
-    col5, col6, col7, col8 = st.columns(4)
-    with col5:
-        total_trades: int = (
-            state.latest_status.get("total_trades", 0)
-            if state.latest_status
-            else 0
-        )
-        st.metric(label="Total Trades", value=str(total_trades))
-    with col6:
-        st.metric(label="Edge Captured", value=summaries["Edge Captured"])
-    with col7:
-        consec: int = (
-            state.latest_status.get("consecutive_losses", 0)
-            if state.latest_status
-            else 0
-        )
-        st.metric(label="Consec. Losses", value=str(consec))
-    with col8:
-        compounding: str = (
-            "ON"
-            if state.latest_status and state.latest_status.get("compounding_active")
-            else "OFF"
-        )
-        st.metric(label="Compounding", value=compounding)
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(
+                label="USDC Balance",
+                value=f"${state.balance:.2f}",
+            )
+        with col2:
+            st.metric(label="24h Win Rate", value=summaries["24h Win Rate"])
+        with col3:
+            st.metric(label="Max Drawdown", value=summaries["Max Drawdown"])
+        with col4:
+            st.metric(label="Avg Latency", value=summaries["Avg Latency"])
 
-    # --- Row 2: Equity Curve ---
-    st.subheader("Equity Curve")
-    fig: plt.Figure = render_equity_curve(state.equity_curve)
-    st.pyplot(fig)
-    plt.close(fig)  # free memory
+        # Secondary metrics row
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
+            total_trades: int = (
+                state.latest_status.get("total_trades", 0)
+                if state.latest_status
+                else 0
+            )
+            st.metric(label="Total Trades", value=str(total_trades))
+        with col6:
+            st.metric(label="Edge Captured", value=summaries["Edge Captured"])
+        with col7:
+            consec: int = (
+                state.latest_status.get("consecutive_losses", 0)
+                if state.latest_status
+                else 0
+            )
+            st.metric(label="Consec. Losses", value=str(consec))
+        with col8:
+            compounding: str = (
+                "ON"
+                if state.latest_status and state.latest_status.get("compounding_active")
+                else "OFF"
+            )
+            st.metric(label="Compounding", value=compounding)
 
-    # --- Row 3: Trade History Table ---
-    st.subheader("Recent Trades (Last 50)")
-    df: pd.DataFrame = render_trade_table(state.trades)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+        # --- Row 2: Equity Curve ---
+        st.subheader("Equity Curve")
+        fig: plt.Figure = render_equity_curve(state.equity_curve)
+        st.pyplot(fig)
+        plt.close(fig)  # free memory
+
+        # --- Row 3: Trade History Table ---
+        st.subheader("Recent Trades (Last 50)")
+        df: pd.DataFrame = render_trade_table(state.trades)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # === BACKTEST TAB ===
+    with tab_backtest:
+        _render_backtest_tab()
 
     # --- Sidebar: Controls ---
     with st.sidebar:
@@ -486,6 +642,12 @@ def main_page() -> None:
         # Gas estimate (Polygon is cheap — static estimate)
         st.metric(label="Est. Gas / Trade", value="~$0.01")
         st.caption("Polygon gas is typically <$0.01 per transaction")
+
+        st.divider()
+        st.caption(
+            "Use the **Backtest** tab to validate strategy on 30 days "
+            "of historical data before risking live capital."
+        )
 
     # --- Auto-refresh ---
     time.sleep(REFRESH_INTERVAL)

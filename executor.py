@@ -183,30 +183,18 @@ class OrderExecutor:
         balance: float,
         kelly_fraction: float,
         price: float,
-        max_exposure_pct: float = 0.10,
+        max_exposure_pct: float = 0.15,
     ) -> Optional[float]:
-        """Compute order size in conditional tokens with all safety guards.
+        """Compute order size in conditional tokens — full Kelly flow-through.
 
-        Sizing pipeline:
-        1. Available capital = balance - safety_floor - gas_buffer
-           (never touch the safety floor — it's our survival guarantee)
-        2. Dollar risk = available * kelly_fraction
-           (Kelly tells us the optimal fraction of bankroll to risk)
-        3. Clamp to 5%-max_exposure_pct of total balance
-           (hard limits prevent model errors from oversizing)
-        4. Size in tokens = dollar_risk / price
-           (convert dollar amount to token quantity)
-
-        The clamping is a second safety net beyond Kelly.
-        Even if the model outputs a high Kelly fraction due to a
-        spurious edge, the clamp prevents catastrophic position sizes.
+        Explosive mode: no 5% floor clamp. Full Kelly fraction flows through
+        to maximize compounding speed. Only capped at max_exposure_pct (15%).
 
         Args:
             balance: Current USDC balance (live from get_current_balance)
-            kelly_fraction: Optimal bet fraction from model (0 to 0.25)
+            kelly_fraction: Optimal bet fraction from model (0 to 1.0)
             price: Order price per token
-            max_exposure_pct: Maximum exposure as fraction of balance (0.05-0.10),
-                              adjustable via dashboard slider
+            max_exposure_pct: Maximum exposure as fraction of balance (default 0.15)
 
         Returns:
             Order size in tokens, or None if insufficient balance
@@ -219,19 +207,12 @@ class OrderExecutor:
             )
             return None
 
-        # Kelly-sized dollar risk
+        # Full Kelly-sized dollar risk — no down-scaling
         dollar_risk: float = available * kelly_fraction
 
-        # Hard clamp to max_exposure_pct of total balance regardless of Kelly output.
-        # Only enforce the 5% floor when Kelly signals meaningful conviction
-        # (fraction >= 0.01). Otherwise, respect Kelly's low sizing on weak signals
-        # to avoid oversizing trades where the model has low confidence.
+        # Cap at max_exposure_pct of total balance
         max_risk: float = balance * max_exposure_pct
-        if kelly_fraction >= 0.01:
-            min_risk: float = balance * 0.05
-            dollar_risk = max(min(dollar_risk, max_risk), min_risk)
-        else:
-            dollar_risk = min(dollar_risk, max_risk)
+        dollar_risk = min(dollar_risk, max_risk)
 
         # Never exceed available capital
         dollar_risk = min(dollar_risk, available)
@@ -613,91 +594,101 @@ class OrderExecutor:
             self.logger.warning(f"Cancel order {order_id[:12]}... failed: {e}")
             return False
 
-    def place_mm_pair(
+    def place_mm_batch(
         self,
         yes_token_id: str,
         no_token_id: str,
-        yes_price: float,
-        no_price: float,
+        batch_levels: dict,
         balance: float,
-        mm_exposure_pct: float = 0.05,
-    ) -> Tuple[Optional[OrderResult], Optional[OrderResult]]:
-        """Place simultaneous maker limit BUYs on both YES and NO tokens.
+        mm_exposure_pct: float = 0.15,
+        batch_size: int = 5,
+    ) -> Tuple[List[OrderResult], List[OrderResult]]:
+        """Place batch maker limit BUYs on both YES and NO tokens at staggered levels.
 
-        Market-making spread trade: buy both sides when YES_mid + NO_mid < 0.99
-        to lock in guaranteed payout minus costs. Each side is sized to
-        mm_exposure_pct of balance (5% each, 10% total exposure).
+        Explosive MM: up to batch_size orders per side at staggered price levels,
+        sized to mm_exposure_pct (15%) of balance per side, split across levels.
 
         Args:
             yes_token_id: YES outcome token ID
             no_token_id: NO outcome token ID
-            yes_price: Limit price for YES buy (midpoint - 0.01)
-            no_price: Limit price for NO buy (midpoint - 0.01)
+            batch_levels: Dict with 'yes' and 'no' lists of price levels
             balance: Current USDC balance
-            mm_exposure_pct: Fraction of balance per side (default 5%)
+            mm_exposure_pct: Fraction of balance per side (default 15%)
+            batch_size: Number of orders per side (default 5)
 
         Returns:
-            Tuple of (yes_order, no_order), either may be None on failure
+            Tuple of (yes_orders, no_orders) lists
         """
-        # Reserve 2x gas (one per order)
-        available: float = balance - self.safety_floor - self.gas_buffer * 2
+        total_orders: int = batch_size * 2
+        available: float = balance - self.safety_floor - self.gas_buffer * total_orders
         if available <= 0:
             self.logger.warning(
-                f"MM pair: below safety floor: balance={balance:.2f}"
+                f"MM batch: below safety floor: balance={balance:.2f}"
             )
-            return (None, None)
+            return ([], [])
 
         dollar_per_side: float = available * mm_exposure_pct
         dollar_per_side = min(dollar_per_side, available / 2)  # never exceed half
+        dollar_per_order: float = dollar_per_side / batch_size
 
-        yes_size: float = round(dollar_per_side / yes_price, 2) if yes_price > 0 else 0
-        no_size: float = round(dollar_per_side / no_price, 2) if no_price > 0 else 0
+        yes_prices: list = batch_levels.get("yes", [])[:batch_size]
+        no_prices: list = batch_levels.get("no", [])[:batch_size]
 
-        if yes_size < 0.01 or no_size < 0.01:
-            self.logger.warning("MM pair: size too small after safety guards")
-            return (None, None)
+        yes_orders: List[OrderResult] = []
+        no_orders: List[OrderResult] = []
 
-        yes_order: Optional[OrderResult] = None
-        no_order: Optional[OrderResult] = None
+        # Place YES side orders at staggered levels
+        for i, price in enumerate(yes_prices):
+            if price <= 0:
+                continue
+            size: float = round(dollar_per_order / price, 2)
+            if size < 0.01:
+                continue
+            try:
+                args = OrderArgs(
+                    token_id=yes_token_id, price=price,
+                    size=size, side=BUY,
+                )
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.GTC)
+                order = OrderResult(
+                    order_id=resp.get("orderID", ""),
+                    side=BUY, price=price, size=size,
+                    token_id=yes_token_id, timestamp=time.time(), status="posted",
+                )
+                self.active_orders.append(order)
+                yes_orders.append(order)
+                self.logger.info(
+                    f"MM YES batch [{i+1}/{batch_size}]: {size:.2f} @ {price:.3f}"
+                )
+            except Exception as e:
+                self.logger.error(f"MM YES batch [{i+1}] failed: {e}")
 
-        # Place YES side
-        try:
-            yes_args = OrderArgs(
-                token_id=yes_token_id, price=yes_price,
-                size=yes_size, side=BUY,
-            )
-            yes_signed = self.client.create_order(yes_args)
-            yes_resp = self.client.post_order(yes_signed, OrderType.GTC)
-            yes_order = OrderResult(
-                order_id=yes_resp.get("orderID", ""),
-                side=BUY, price=yes_price, size=yes_size,
-                token_id=yes_token_id, timestamp=time.time(), status="posted",
-            )
-            self.active_orders.append(yes_order)
-            self.logger.info(
-                f"MM YES order posted: {yes_size:.2f} @ {yes_price:.2f}"
-            )
-        except Exception as e:
-            self.logger.error(f"MM YES order failed: {e}")
+        # Place NO side orders at staggered levels
+        for i, price in enumerate(no_prices):
+            if price <= 0:
+                continue
+            size = round(dollar_per_order / price, 2)
+            if size < 0.01:
+                continue
+            try:
+                args = OrderArgs(
+                    token_id=no_token_id, price=price,
+                    size=size, side=BUY,
+                )
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.GTC)
+                order = OrderResult(
+                    order_id=resp.get("orderID", ""),
+                    side=BUY, price=price, size=size,
+                    token_id=no_token_id, timestamp=time.time(), status="posted",
+                )
+                self.active_orders.append(order)
+                no_orders.append(order)
+                self.logger.info(
+                    f"MM NO batch [{i+1}/{batch_size}]: {size:.2f} @ {price:.3f}"
+                )
+            except Exception as e:
+                self.logger.error(f"MM NO batch [{i+1}] failed: {e}")
 
-        # Place NO side
-        try:
-            no_args = OrderArgs(
-                token_id=no_token_id, price=no_price,
-                size=no_size, side=BUY,
-            )
-            no_signed = self.client.create_order(no_args)
-            no_resp = self.client.post_order(no_signed, OrderType.GTC)
-            no_order = OrderResult(
-                order_id=no_resp.get("orderID", ""),
-                side=BUY, price=no_price, size=no_size,
-                token_id=no_token_id, timestamp=time.time(), status="posted",
-            )
-            self.active_orders.append(no_order)
-            self.logger.info(
-                f"MM NO order posted: {no_size:.2f} @ {no_price:.2f}"
-            )
-        except Exception as e:
-            self.logger.error(f"MM NO order failed: {e}")
-
-        return (yes_order, no_order)
+        return (yes_orders, no_orders)

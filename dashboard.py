@@ -604,18 +604,30 @@ def main_page() -> None:
             unsafe_allow_html=True,
         )
 
-        # --- MM Mode Indicator ---
-        if state.latest_status and state.latest_status.get("mm_active"):
-            st.markdown(
-                '<div style="padding:6px 12px;border-radius:6px;background:#ff6b00;'
-                'color:white;text-align:center;font-weight:bold;margin-bottom:8px">'
-                'MM Mode Active &mdash; Spread Locked</div>',
-                unsafe_allow_html=True,
-            )
+        # --- Explosive Mode Indicator ---
+        if state.latest_status and state.latest_status.get("explosive_mode"):
+            if state.latest_status.get("mm_active"):
+                st.markdown(
+                    '<div style="padding:8px 14px;border-radius:8px;'
+                    'background:linear-gradient(90deg,#ff4500,#ff6b00);'
+                    'color:white;text-align:center;font-weight:bold;margin-bottom:8px;'
+                    'font-size:1.1em">'
+                    'Explosive Mode Active &mdash; Batch Spread Locked</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div style="padding:8px 14px;border-radius:8px;'
+                    'background:linear-gradient(90deg,#ff4500,#cc3700);'
+                    'color:white;text-align:center;font-weight:bold;margin-bottom:8px;'
+                    'font-size:1.1em">'
+                    'Explosive Mode &mdash; Full Kelly | 15% Exposure | 0.985 Threshold</div>',
+                    unsafe_allow_html=True,
+                )
 
-        # --- MM Metrics ---
+        # --- MM / Explosive Metrics ---
         if state.latest_status and state.latest_status.get("mm_trades", 0) > 0:
-            mm_col1, mm_col2 = st.columns(2)
+            mm_col1, mm_col2, mm_col3 = st.columns(3)
             with mm_col1:
                 st.metric(
                     "MM Trades",
@@ -625,6 +637,38 @@ def main_page() -> None:
                 st.metric(
                     "MM Spread Profit",
                     f"${state.latest_status.get('mm_spread_profit', 0):.4f}",
+                )
+            with mm_col3:
+                imb = state.latest_status.get("orderflow_imbalance", 0)
+                imb_label = f"{imb:+.3f}"
+                if abs(imb) >= 0.20:
+                    imb_label += " (BIASED)"
+                st.metric("Order Flow", imb_label)
+
+        # --- Projected Monthly Return ---
+        if state.latest_status:
+            total_trades = state.latest_status.get("total_trades", 0)
+            mm_profit = state.latest_status.get("mm_spread_profit", 0)
+            balance = state.latest_status.get("current_balance", 0)
+            starting = 100.0  # default starting capital
+
+            if total_trades > 0 and balance > 0:
+                net_return = (balance - starting + mm_profit) / starting
+                # Estimate trades per hour from trade history length
+                if len(state.trades) >= 2:
+                    first_ts = state.trades[0].get("timestamp", time.time())
+                    last_ts = state.trades[-1].get("timestamp", time.time())
+                    elapsed_h = max((last_ts - first_ts) / 3600, 0.1)
+                    trades_per_hour = total_trades / elapsed_h
+                else:
+                    trades_per_hour = 12.0  # ~288 windows/day / 24h
+                trades_per_month = trades_per_hour * 24 * 30
+                edge_per_trade = net_return / total_trades
+                # Compound projected return
+                projected = (1 + edge_per_trade) ** min(trades_per_month, 50000) - 1
+                st.metric(
+                    "Projected Monthly Return",
+                    f"{projected:,.0%}",
                 )
 
         # --- Row 2: Equity Curve ---

@@ -2,10 +2,8 @@
 config.py — Central configuration for the Polymarket BTC 5-minute bot.
 
 Loads secrets from .env and defines all runtime constants in a frozen dataclass.
-Every parameter is tuned for positive expectancy on 5-minute binary BTC markets:
-- Conservative Kelly sizing (quarter-Kelly cap) prevents ruin
-- 0.3% round-trip cost assumption is worst-case; maker rebates reduce this
-- Compounding only activates after statistical significance (200 trades)
+Explosive compounding mode: full Kelly sizing, tighter spread hunting, instant
+compounding, and 15% per-side MM exposure for maximum growth velocity.
 """
 
 import logging
@@ -37,7 +35,7 @@ class Config:
     # Per-window exposure as fraction of current balance.
     # Kelly output is clamped to this band to prevent oversizing on noisy signals.
     min_exposure_pct: float = 0.05  # 5% floor — ensures meaningful position sizes
-    max_exposure_pct: float = 0.10  # 10% cap — limits single-window risk
+    max_exposure_pct: float = 0.15  # 15% cap — aggressive per-window sizing
 
     # Minimum edge (true_prob - implied_prob - costs) required to trade.
     # Below this threshold, signal-to-noise is too low for reliable profit.
@@ -47,13 +45,12 @@ class Config:
     # The Bayesian model + MC simulation determine actual trade signals.
     target_win_rate: float = 0.60  # 60%
 
-    # Consecutive loss streak circuit breaker. If hit, skip current window
-    # and wait for next market to avoid tilt-driven losses.
-    max_consecutive_losses: int = 5
+    # Consecutive loss streak circuit breaker. Set to 999 to effectively disable —
+    # explosive mode accepts variance for maximum compounding.
+    max_consecutive_losses: int = 999
 
-    # Compounding activates only after sufficient sample size proves edge is real.
-    # Before activation, position sizes stay flat relative to starting capital.
-    compounding_activation_trades: int = 200
+    # Instant compounding: 0 = activate from first trade, no waiting period.
+    compounding_activation_trades: int = 0
 
     # --- Cost Constants ---
     # Gas buffer reserved per trade for Polygon transaction fees.
@@ -72,8 +69,8 @@ class Config:
     safety_floor_usdc: float = 10.0
 
     # Hard stop: if drawdown from peak exceeds this, halt all trading.
-    # Protects against regime changes or model breakdown.
-    drawdown_hard_stop_pct: float = 0.25  # 25%
+    # 40% accepts higher variance for explosive upside.
+    drawdown_hard_stop_pct: float = 0.40  # 40%
 
     # --- Polymarket CLOB Connection ---
     clob_host: str = "https://clob.polymarket.com"
@@ -91,15 +88,20 @@ class Config:
     # time for maker fill + price movement to realize edge
     min_remaining_window_secs: int = 10
 
-    # --- Market-Making Mode ---
-    # When YES_mid + NO_mid < threshold, buy both sides to lock in spread profit.
-    # After cancel_delay seconds, drop the losing side and ride the winner.
+    # --- Market-Making Mode (Explosive) ---
+    # Tighter spread threshold hunts more opportunities. Batch orders (up to 5/side)
+    # at staggered levels maximize fill probability. 15% per side for aggressive sizing.
     mm_enabled: bool = True
-    mm_spread_threshold: float = 0.99     # trigger when yes_mid + no_mid < this
-    mm_exposure_pct: float = 0.05         # 5% of balance PER SIDE (10% total)
-    mm_cancel_delay_secs: float = 45.0    # seconds before cancelling losing side
-    mm_check_interval_secs: float = 3.0   # how often to check for MM opportunity
-    mm_min_remaining_secs: float = 90.0   # minimum window time left for MM entry
+    mm_spread_threshold: float = 0.985    # tighter than 0.99 — hunt more spreads
+    mm_exposure_pct: float = 0.15         # 15% of balance PER SIDE (30% total)
+    mm_cancel_delay_secs: float = 30.0    # faster decisions — 30s not 45s
+    mm_check_interval_secs: float = 2.0   # check every 2s for maximum responsiveness
+    mm_min_remaining_secs: float = 60.0   # enter closer to expiry
+    mm_batch_size: int = 5                # up to 5 simultaneous orders per side
+
+    # --- Order Flow Imbalance ---
+    # When bid/ask depth delta > threshold, ride the dominant side harder.
+    orderflow_imbalance_threshold: float = 0.20  # 20% delta triggers side bias
 
     # --- Monte Carlo Simulation ---
     # 1000 paths balances accuracy vs latency. Vectorized numpy keeps this <5ms.
@@ -229,11 +231,15 @@ def load_config() -> Config:
                 f"got {addr}, expected {expected}"
             )
 
-    # Market-making overrides from .env
+    # Market-making overrides from .env (explosive defaults)
     mm_enabled: bool = os.getenv("MM_ENABLED", "true").lower() == "true"
-    mm_spread_threshold: float = float(os.getenv("MM_SPREAD_THRESHOLD", "0.99"))
-    mm_exposure_pct: float = float(os.getenv("MM_EXPOSURE_PCT", "0.05"))
-    mm_cancel_delay_secs: float = float(os.getenv("MM_CANCEL_DELAY_SECS", "45.0"))
+    mm_spread_threshold: float = float(os.getenv("MM_SPREAD_THRESHOLD", "0.985"))
+    mm_exposure_pct: float = float(os.getenv("MM_EXPOSURE_PCT", "0.15"))
+    mm_cancel_delay_secs: float = float(os.getenv("MM_CANCEL_DELAY_SECS", "30.0"))
+    mm_batch_size: int = int(os.getenv("MM_BATCH_SIZE", "5"))
+    orderflow_imbalance_threshold: float = float(
+        os.getenv("ORDERFLOW_IMBALANCE_THRESHOLD", "0.20")
+    )
 
     return Config(
         private_key=private_key,
@@ -248,4 +254,6 @@ def load_config() -> Config:
         mm_spread_threshold=mm_spread_threshold,
         mm_exposure_pct=mm_exposure_pct,
         mm_cancel_delay_secs=mm_cancel_delay_secs,
+        mm_batch_size=mm_batch_size,
+        orderflow_imbalance_threshold=orderflow_imbalance_threshold,
     )

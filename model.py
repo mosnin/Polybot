@@ -430,7 +430,7 @@ class BayesianModel:
         return (ev, win_prob, variance)
 
     def _kelly_fraction(self, win_prob: float, payout_ratio: float = 1.0) -> float:
-        """Compute optimal bet size via Kelly criterion.
+        """Compute optimal bet size via full Kelly criterion.
 
         Kelly formula: f* = (b*p - q) / b
         where:
@@ -438,25 +438,20 @@ class BayesianModel:
             p = probability of winning
             q = 1 - p = probability of losing
 
-        For binary Polymarket outcomes:
-            If we buy at price `implied`, payout on win is $1.00
-            So b = (1 - implied) / implied
-
-        We cap at quarter-Kelly (0.25) for safety. Full Kelly maximizes
-        long-term growth rate but has brutal drawdowns. Quarter-Kelly
-        achieves ~75% of the growth rate with dramatically lower variance.
+        Explosive mode: full Kelly (no down-scaling) for maximum compounding
+        speed. Accepts higher variance in exchange for optimal geometric growth.
 
         Args:
             win_prob: Estimated probability of winning the trade
             payout_ratio: Net payout ratio (1.0 for even-money bets)
 
         Returns:
-            Kelly fraction clamped to [0.0, 0.25]
+            Kelly fraction clamped to [0.0, 1.0]
         """
         q: float = 1.0 - win_prob
         f: float = (payout_ratio * win_prob - q) / payout_ratio
-        # Quarter-Kelly cap: sacrifices ~25% growth for ~75% less variance
-        return max(0.0, min(f, 0.25))
+        # Full Kelly: maximum growth rate, no down-scaling
+        return max(0.0, min(f, 1.0))
 
     def evaluate(
         self,
@@ -571,22 +566,23 @@ class BayesianModel:
         self,
         yes_midpoint: float,
         no_midpoint: float,
-        spread_threshold: float = 0.99,
+        spread_threshold: float = 0.985,
+        batch_size: int = 5,
     ) -> Optional[dict]:
         """Check if YES + NO midpoints create a market-making spread.
 
         When the sum of midpoints < threshold, buying both sides locks in
         guaranteed value (1.00 payout on one side, minus cost of both).
-        The spread = 1.00 - (yes_mid + no_mid) is the raw profit before costs.
+        Generates staggered batch price levels for aggressive fill probability.
 
         Args:
             yes_midpoint: Current CLOB midpoint for YES token (0.0–1.0)
             no_midpoint: Current CLOB midpoint for NO token (0.0–1.0)
-            spread_threshold: Trigger when sum < this (default 0.99)
+            spread_threshold: Trigger when sum < this (default 0.985)
+            batch_size: Number of price levels per side (default 5)
 
         Returns:
-            Dict with spread metrics if opportunity found, None otherwise.
-            Keys: spread, yes_price, no_price, expected_profit, mid_sum
+            Dict with spread metrics + batch_levels if opportunity found, None otherwise.
         """
         mid_sum: float = yes_midpoint + no_midpoint
         if mid_sum >= spread_threshold:
@@ -594,7 +590,7 @@ class BayesianModel:
 
         spread: float = 1.0 - mid_sum
 
-        # Order prices: one tick below each midpoint (maker side)
+        # Best price: one tick below midpoint (maker side)
         yes_price: float = round(yes_midpoint - 0.01, 2)
         no_price: float = round(no_midpoint - 0.01, 2)
 
@@ -609,10 +605,67 @@ class BayesianModel:
         if expected_profit <= 0:
             return None  # spread doesn't cover costs
 
+        # Generate staggered batch levels (0.005 apart below midpoint)
+        yes_levels: list = []
+        no_levels: list = []
+        for i in range(batch_size):
+            yp: float = round(yes_midpoint - 0.01 - i * 0.005, 3)
+            np_: float = round(no_midpoint - 0.01 - i * 0.005, 3)
+            yes_levels.append(max(0.01, min(0.99, yp)))
+            no_levels.append(max(0.01, min(0.99, np_)))
+
         return {
             "spread": spread,
             "yes_price": yes_price,
             "no_price": no_price,
             "expected_profit": expected_profit,
             "mid_sum": mid_sum,
+            "batch_levels": {
+                "yes": yes_levels,
+                "no": no_levels,
+            },
+        }
+
+    def compute_orderflow_imbalance(
+        self,
+        order_book: dict,
+        lookback_depth: int = 5,
+        threshold: float = 0.20,
+    ) -> dict:
+        """Calculate bid/ask depth delta from CLOB order book.
+
+        Sums the top `lookback_depth` levels on each side to determine
+        whether buying or selling pressure dominates. Used to bias MM
+        side selection when imbalance exceeds threshold.
+
+        Args:
+            order_book: Dict with 'bids' and 'asks' arrays of {price, size}
+            lookback_depth: Number of top levels to consider
+            threshold: Minimum abs(imbalance) to trigger side bias
+
+        Returns:
+            Dict with imbalance (-1 to 1), favor_side ("YES"/"NO"/None),
+            and magnitude (abs of imbalance).
+        """
+        bids: list = order_book.get("bids", [])[:lookback_depth]
+        asks: list = order_book.get("asks", [])[:lookback_depth]
+
+        bid_vol: float = sum(float(b.get("size", 0)) for b in bids)
+        ask_vol: float = sum(float(a.get("size", 0)) for a in asks)
+        total: float = bid_vol + ask_vol
+
+        if total == 0:
+            return {"imbalance": 0.0, "favor_side": None, "magnitude": 0.0}
+
+        imbalance: float = (bid_vol - ask_vol) / total
+        magnitude: float = abs(imbalance)
+
+        favor_side: Optional[str] = None
+        if magnitude >= threshold:
+            favor_side = "YES" if imbalance > 0 else "NO"
+
+        return {
+            "imbalance": round(imbalance, 4),
+            "favor_side": favor_side,
+            "magnitude": round(magnitude, 4),
         }

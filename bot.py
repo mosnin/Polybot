@@ -167,14 +167,16 @@ class AsyncBot:
         self._drawdown_alert_sent: bool = False
         self._latency_alert_sent: bool = False
 
-        # Market-making state
+        # Market-making state (explosive: batch orders, orderflow tracking)
         self._mm_active: bool = False
-        self._mm_yes_order: Optional[OrderResult] = None
-        self._mm_no_order: Optional[OrderResult] = None
+        self._mm_yes_orders: List[OrderResult] = []
+        self._mm_no_orders: List[OrderResult] = []
         self._mm_entry_time: float = 0.0
         self._mm_spread_profit: float = 0.0
         self._last_mm_check: float = 0.0
         self._mm_pending_cancel: bool = False
+        self._orderflow_imbalance: float = 0.0
+        self._mm_no_opportunity_count: int = 0
 
         # Redis connection for equity history + bot state persistence (optional).
         # Shares the same Redis URL as the model for state continuity across restarts.
@@ -324,25 +326,22 @@ class AsyncBot:
         return sum(daily_returns) / len(daily_returns)
 
     def _update_compounding(self) -> None:
-        """Activate compounding after sufficient statistical evidence.
+        """Activate compounding — instant in explosive mode.
 
-        Triple gate — all conditions must be met:
-        1. At least 200 trades (statistical significance)
-        2. Win rate > 50% (edge is real)
-        3. Average daily return > 1% (profitability confirmed)
-
-        Before activation, position sizes are capped to starting_capital
-        to limit exposure while the edge is unproven. After activation,
-        sizes scale dynamically with the full live balance via Kelly.
-
-        Why 200 trades? At 60% true win rate:
-        - 95% CI for observed win rate is [53%, 67%]
-        - This is narrow enough to confirm edge is real, not luck
+        When compounding_activation_trades == 0, compounding activates
+        immediately from the first trade for maximum growth velocity.
+        Otherwise falls back to the triple gate (trades + win rate + daily return).
         """
-        if (
-            self.state.total_trades >= self.config.compounding_activation_trades
-            and not self.state.compounding_active
-        ):
+        if self.state.compounding_active:
+            return
+
+        if self.config.compounding_activation_trades == 0:
+            # Explosive mode: instant compounding from trade 1
+            self.state.compounding_active = True
+            self.logger.info("COMPOUNDING ACTIVATED: explosive mode (instant)")
+            return
+
+        if self.state.total_trades >= self.config.compounding_activation_trades:
             win_rate: float = self.state.wins / max(self.state.total_trades, 1)
             avg_daily: float = self._compute_avg_daily_return()
             if win_rate > 0.5 and avg_daily > 0.01:
@@ -628,18 +627,16 @@ class AsyncBot:
     async def _check_mm_opportunity(
         self, loop: asyncio.AbstractEventLoop
     ) -> bool:
-        """Check for and execute a market-making spread opportunity.
+        """Check for and execute a market-making spread opportunity (explosive mode).
 
-        Fetches both YES and NO midpoints in parallel, checks if their sum
-        is below the MM threshold (default 0.99), and places simultaneous
-        maker limit BUYs on both sides if the spread covers costs.
+        Fetches both YES and NO midpoints + order book in parallel, checks spread
+        threshold (0.985), computes order-flow imbalance, and places batch orders
+        (up to 5 per side) at staggered price levels.
 
-        Throttled internally to run at most every ``mm_check_interval_secs``.
-        Prioritized before directional trading — if MM triggers, directional
-        logic is skipped for this cycle.
+        Throttled to every 2 seconds. Prioritized before directional trading.
 
         Returns:
-            True if MM trade was placed (caller should skip directional)
+            True if MM batch was placed (caller should skip directional)
         """
         if not self.config.mm_enabled:
             return False
@@ -657,9 +654,9 @@ class AsyncBot:
         if remaining < self.config.mm_min_remaining_secs:
             return False
 
-        # Fetch both midpoints in parallel
+        # Fetch both midpoints + YES order book in parallel
         try:
-            yes_mid, no_mid = await asyncio.gather(
+            yes_mid, no_mid, order_book = await asyncio.gather(
                 loop.run_in_executor(
                     None, self.executor.get_midpoint,
                     self.current_market.yes_token_id,
@@ -667,6 +664,10 @@ class AsyncBot:
                 loop.run_in_executor(
                     None, self.executor.get_midpoint,
                     self.current_market.no_token_id,
+                ),
+                loop.run_in_executor(
+                    None, self.executor.get_order_book,
+                    self.current_market.yes_token_id,
                 ),
             )
             yes_mid = float(yes_mid)
@@ -680,54 +681,70 @@ class AsyncBot:
             yes_midpoint=yes_mid,
             no_midpoint=no_mid,
             spread_threshold=self.config.mm_spread_threshold,
+            batch_size=self.config.mm_batch_size,
         )
 
         if mm_signal is None:
+            self._mm_no_opportunity_count += 1
             return False
 
+        # Compute order-flow imbalance for side bias
+        flow = self.model.compute_orderflow_imbalance(
+            order_book,
+            threshold=self.config.orderflow_imbalance_threshold,
+        )
+        self._orderflow_imbalance = flow["imbalance"]
+
         self.logger.info(
-            f"MM OPPORTUNITY: spread={mm_signal['spread']:.4f} "
+            f"MM EXPLOSIVE: spread={mm_signal['spread']:.4f} "
             f"YES={yes_mid:.3f} NO={no_mid:.3f} "
-            f"expected_profit={mm_signal['expected_profit']:.4f}"
+            f"profit={mm_signal['expected_profit']:.4f} "
+            f"flow={flow['imbalance']:+.3f} favor={flow['favor_side']}"
         )
 
         if self.state.test_mode:
             self.logger.info("[TEST MODE] MM opportunity detected, not placing orders")
             return True
 
-        # Place both sides
-        yes_order, no_order = await loop.run_in_executor(
+        # Place batch orders on both sides
+        yes_orders, no_orders = await loop.run_in_executor(
             None,
-            self.executor.place_mm_pair,
+            self.executor.place_mm_batch,
             self.current_market.yes_token_id,
             self.current_market.no_token_id,
-            mm_signal["yes_price"],
-            mm_signal["no_price"],
+            mm_signal["batch_levels"],
             self.state.current_balance,
             self.config.mm_exposure_pct,
+            self.config.mm_batch_size,
         )
 
-        if yes_order is None and no_order is None:
-            self.logger.warning("MM: both orders failed, aborting")
+        if not yes_orders and not no_orders:
+            self.logger.warning("MM batch: all orders failed, aborting")
             return False
 
-        # If only one side placed, cancel it — partial MM is not allowed
-        if yes_order is None or no_order is None:
-            orphan = yes_order or no_order
-            await loop.run_in_executor(
-                None, self.executor.cancel_order, orphan.order_id
-            )
-            self.logger.warning("MM: only one leg placed, cancelled orphan")
+        # Need at least one order on each side for valid MM
+        if not yes_orders or not no_orders:
+            orphans = yes_orders or no_orders
+            for orphan in orphans:
+                await loop.run_in_executor(
+                    None, self.executor.cancel_order, orphan.order_id
+                )
+            self.logger.warning("MM batch: one side empty, cancelled orphans")
             return False
 
         self._mm_active = True
-        self._mm_yes_order = yes_order
-        self._mm_no_order = no_order
+        self._mm_yes_orders = yes_orders
+        self._mm_no_orders = no_orders
         self._mm_entry_time = time.time()
         self._mm_pending_cancel = False
+        self._mm_no_opportunity_count = 0
         self.state.mm_active = True
         self.state.mm_trades += 1
         self.state.total_trades += 1
+
+        total_yes_size: float = sum(o.size for o in yes_orders)
+        total_no_size: float = sum(o.size for o in no_orders)
+        gas_total: float = self.config.gas_buffer_usdc * (len(yes_orders) + len(no_orders))
 
         # Push MM trade event to dashboard
         self._push_event({
@@ -740,12 +757,14 @@ class AsyncBot:
             "implied_prob": mm_signal["mid_sum"],
             "kelly_fraction": 0.0,
             "fill_price": mm_signal["yes_price"] + mm_signal["no_price"],
-            "size": yes_order.size + no_order.size,
+            "size": total_yes_size + total_no_size,
             "mc_ev": mm_signal["expected_profit"],
             "outcome": None,
-            "gas_paid": self.config.gas_buffer_usdc * 2,
+            "gas_paid": gas_total,
             "net_pnl": None,
             "mm_spread": mm_signal["spread"],
+            "orderflow_imbalance": flow["imbalance"],
+            "batch_count": len(yes_orders) + len(no_orders),
         })
 
         return True
@@ -753,16 +772,13 @@ class AsyncBot:
     async def _manage_mm_position(
         self, loop: asyncio.AbstractEventLoop
     ) -> None:
-        """Manage an active MM position: cancel the losing side after delay.
+        """Manage active MM batch position: cancel losing side after delay.
 
-        Called every cycle when ``_mm_active`` is True. After
-        ``mm_cancel_delay_secs`` (default 45s), the Bayesian model's
-        directional estimate determines which side to keep. The loser is
-        cancelled and the winner rides out with the original directional
-        logic (via ``_pending_prediction``).
+        After cancel_delay_secs (30s), uses BOTH Bayesian model direction
+        AND order-flow imbalance to determine winner. If flow imbalance > 20%,
+        flow overrides model direction ("ride that side harder").
 
-        Safety: if the window is about to expire (<15s remaining), both
-        sides are cancelled to avoid stuck positions.
+        Cancels ALL orders on the losing side, keeps all on the winning side.
         """
         if not self._mm_active:
             return
@@ -773,41 +789,63 @@ class AsyncBot:
         if elapsed >= self.config.mm_cancel_delay_secs and not self._mm_pending_cancel:
             self._mm_pending_cancel = True
 
-            # Use the Bayesian model's current directional estimate
-            if self.model.true_prob_up >= 0.5:
-                cancel_order = self._mm_no_order
-                keep_direction = "UP"
+            # Default: use Bayesian model direction
+            keep_direction: str = "UP" if self.model.true_prob_up >= 0.5 else "DOWN"
+
+            # Override with order-flow imbalance if strong enough (>20%)
+            if abs(self._orderflow_imbalance) >= self.config.orderflow_imbalance_threshold:
+                flow_direction: str = "UP" if self._orderflow_imbalance > 0 else "DOWN"
+                if flow_direction != keep_direction:
+                    self.logger.info(
+                        f"MM FLOW OVERRIDE: model={keep_direction} "
+                        f"flow={flow_direction} (imbalance={self._orderflow_imbalance:+.3f})"
+                    )
+                    keep_direction = flow_direction
+
+            # Cancel all orders on losing side
+            if keep_direction == "UP":
+                cancel_orders = self._mm_no_orders
+                keep_orders = self._mm_yes_orders
             else:
-                cancel_order = self._mm_yes_order
-                keep_direction = "DOWN"
+                cancel_orders = self._mm_yes_orders
+                keep_orders = self._mm_no_orders
 
-            await loop.run_in_executor(
-                None, self.executor.cancel_order, cancel_order.order_id
+            for order in cancel_orders:
+                await loop.run_in_executor(
+                    None, self.executor.cancel_order, order.order_id
+                )
+
+            # Compute spread profit across all batch levels
+            avg_yes_price: float = (
+                sum(o.price * o.size for o in self._mm_yes_orders)
+                / max(sum(o.size for o in self._mm_yes_orders), 0.01)
             )
-
-            # Compute spread profit locked in by buying both sides
+            avg_no_price: float = (
+                sum(o.price * o.size for o in self._mm_no_orders)
+                / max(sum(o.size for o in self._mm_no_orders), 0.01)
+            )
+            total_gas: float = self.config.gas_buffer_usdc * (
+                len(self._mm_yes_orders) + len(self._mm_no_orders)
+            )
             spread_pnl: float = (
-                1.0
-                - (self._mm_yes_order.price + self._mm_no_order.price)
-                - self.config.round_trip_cost_pct
-                - self.config.gas_buffer_usdc * 2
+                1.0 - (avg_yes_price + avg_no_price)
+                - self.config.round_trip_cost_pct - total_gas
             )
-            position_value: float = min(
-                self._mm_yes_order.size * self._mm_yes_order.price,
-                self._mm_no_order.size * self._mm_no_order.price,
-            )
+            yes_value: float = sum(o.size * o.price for o in self._mm_yes_orders)
+            no_value: float = sum(o.size * o.price for o in self._mm_no_orders)
+            position_value: float = min(yes_value, no_value)
             spread_pnl_usdc: float = spread_pnl * position_value
 
             self._mm_spread_profit += spread_pnl_usdc
             self.state.mm_spread_profit += spread_pnl_usdc
 
             self.logger.info(
-                f"MM CANCEL: dropped {cancel_order.token_id[:12]}... "
-                f"keeping {keep_direction} side | "
+                f"MM CANCEL: dropped {len(cancel_orders)} orders, "
+                f"keeping {keep_direction} ({len(keep_orders)} orders) | "
                 f"spread P&L: ${spread_pnl_usdc:.4f}"
             )
 
-            # Record pending prediction so the kept side resolves like a directional trade
+            # Record pending prediction so kept side resolves like directional
             self._pending_prediction = {
                 "direction": keep_direction,
                 "entry_price": self.last_price,
@@ -815,8 +853,8 @@ class AsyncBot:
 
             # Reset MM state
             self._mm_active = False
-            self._mm_yes_order = None
-            self._mm_no_order = None
+            self._mm_yes_orders = []
+            self._mm_no_orders = []
             self.state.mm_active = False
             return
 
@@ -824,16 +862,14 @@ class AsyncBot:
         if self.current_market is not None:
             remaining: float = self.current_market.end_timestamp - time.time()
             if remaining < 15.0:
-                self.logger.warning("MM: window expiring, cancelling both sides")
-                await loop.run_in_executor(
-                    None, self.executor.cancel_order, self._mm_yes_order.order_id
-                )
-                await loop.run_in_executor(
-                    None, self.executor.cancel_order, self._mm_no_order.order_id
-                )
+                self.logger.warning("MM: window expiring, cancelling all batch orders")
+                for order in self._mm_yes_orders + self._mm_no_orders:
+                    await loop.run_in_executor(
+                        None, self.executor.cancel_order, order.order_id
+                    )
                 self._mm_active = False
-                self._mm_yes_order = None
-                self._mm_no_order = None
+                self._mm_yes_orders = []
+                self._mm_no_orders = []
                 self.state.mm_active = False
 
     async def _trade_loop(self) -> None:
@@ -942,8 +978,9 @@ class AsyncBot:
                 await loop.run_in_executor(None, self.executor.cancel_all)
                 break
 
-            # Streak check: skip this window if too many consecutive losses
-            if self._check_streak():
+            # Streak check disabled in explosive mode (max_consecutive_losses=999)
+            # Kept as safety net — only triggers if config overridden via .env
+            if self.config.max_consecutive_losses < 999 and self._check_streak():
                 continue
 
             # Step 4b: Market-making spread check (prioritized before directional)
@@ -956,7 +993,9 @@ class AsyncBot:
                 cycle_ms = (time.perf_counter() - cycle_start) * 1000
                 signal = None  # no directional signal on MM cycles
 
-            if not mm_triggered:
+            # Directional as tie-breaker: only fire when MM didn't find opportunity
+            # for 3+ consecutive checks (MM is the primary strategy)
+            if not mm_triggered and self._mm_no_opportunity_count >= 3:
                 # Step 5: Get implied probability + order book in parallel
                 # Parallelizing these two HTTP calls via asyncio.gather keeps
                 # total I/O at max(midpoint_ms, orderbook_ms) instead of the sum,
@@ -1153,6 +1192,8 @@ class AsyncBot:
                 "mm_active": self.state.mm_active,
                 "mm_trades": self.state.mm_trades,
                 "mm_spread_profit": self.state.mm_spread_profit,
+                "orderflow_imbalance": self._orderflow_imbalance,
+                "explosive_mode": self.config.mm_spread_threshold < 0.99,
             })
 
     async def run(self) -> None:

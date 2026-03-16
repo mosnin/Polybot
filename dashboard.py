@@ -321,13 +321,23 @@ def _render_backtest_tab() -> None:
         status_text = st.empty()
 
         def update_progress(pct: float) -> None:
-            progress_bar.progress(
-                min(pct, 1.0),
-                text=f"Simulating windows... {pct * 100:.0f}%",
-            )
+            clamped = max(0.0, min(pct, 1.0))
+            if clamped < 0.5:
+                label = f"Downloading candles... {clamped * 200:.0f}%"
+            else:
+                label = f"Simulating windows... {(clamped - 0.5) * 200:.0f}%"
+            progress_bar.progress(clamped, text=label)
 
         try:
             import asyncio as _asyncio
+            import logging as _logging
+
+            # Ensure backtest logging is visible in console
+            _logging.basicConfig(
+                level=_logging.INFO,
+                format="%(asctime)s | %(name)-12s | %(levelname)-7s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
 
             from backtest import run_backtest
             from config import load_config
@@ -337,11 +347,20 @@ def _render_backtest_tab() -> None:
                 f"Backtesting {config.historical_data_days} days of data..."
             )
             result = _asyncio.run(run_backtest(config, progress_callback=update_progress))
+
+            if result.get("total_trades", 0) == 0:
+                st.warning(
+                    "Backtest completed but generated 0 trades. "
+                    "Model thresholds may be too strict, or data was insufficient."
+                )
+
             st.session_state.backtest_result = result
             progress_bar.progress(1.0, text="Backtest complete!")
             status_text.empty()
         except Exception as e:
             st.error(f"Backtest failed: {e}")
+            import traceback
+            st.code(traceback.format_exc(), language="text")
         finally:
             st.session_state.backtest_running = False
 
@@ -371,13 +390,21 @@ def _render_backtest_tab() -> None:
         real_status = st.empty()
 
         def real_update_progress(pct: float) -> None:
+            clamped = max(0.0, min(pct, 1.0))
             real_progress.progress(
-                min(pct, 1.0),
-                text=f"Processing real market data... {pct * 100:.0f}%",
+                clamped,
+                text=f"Processing real market data... {clamped * 100:.0f}%",
             )
 
         try:
             import asyncio as _asyncio
+            import logging as _logging
+
+            _logging.basicConfig(
+                level=_logging.INFO,
+                format="%(asctime)s | %(name)-12s | %(levelname)-7s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
 
             from backtest import run_real_backtest
             from config import load_config
@@ -400,6 +427,8 @@ def _render_backtest_tab() -> None:
                 )
         except Exception as e:
             st.error(f"Real backtest failed: {e}")
+            import traceback
+            st.code(traceback.format_exc(), language="text")
         finally:
             st.session_state.real_backtest_running = False
 

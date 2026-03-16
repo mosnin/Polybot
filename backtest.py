@@ -69,7 +69,10 @@ def _cache_is_valid(path: str) -> bool:
     return age_hours < CACHE_MAX_AGE_HOURS
 
 
-async def download_historical_ticks(days: int = 30) -> List[dict]:
+async def download_historical_ticks(
+    days: int = 30,
+    progress_callback: Optional[Callable[[float], None]] = None,
+) -> List[dict]:
     """Download BTC/USDT-SWAP 1-minute candles from OKX REST API.
 
     Uses GET /api/v5/market/history-candles with bar=1m (no API key required,
@@ -84,6 +87,7 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
 
     Args:
         days: Number of historical days to download (default 30)
+        progress_callback: Optional callable(float) for progress updates (0.0 to 1.0)
 
     Returns:
         List of {"timestamp": int_ms, "price": float} dicts, sorted chronologically
@@ -114,19 +118,27 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
         if after_ms is not None:
             url += f"&after={after_ms}"
         result = subprocess.run(
-            ["curl", "-s", "--max-time", "15", url],
+            ["curl", "-s", "-S", "--max-time", "15", url],
             capture_output=True, text=True, timeout=20,
         )
+        if result.returncode != 0:
+            stderr_msg = result.stderr.strip() if result.stderr else "unknown error"
+            raise RuntimeError(f"curl failed (exit {result.returncode}): {stderr_msg}")
+        if not result.stdout.strip():
+            raise RuntimeError("curl returned empty response")
         return json.loads(result.stdout)
 
     minute_candles: List[dict] = []
     after_ms: Optional[int] = None
     batch: int = 0
+    # Estimate total batches for progress: days * 24 * 60 / LIMIT
+    est_total_batches: int = max(1, days * 24 * 60 // LIMIT)
 
     while True:
         retries: int = 0
         payload: Optional[dict] = None
-        while retries <= 8:
+        last_error: Optional[str] = None
+        while retries <= 4:
             try:
                 payload = await asyncio.get_event_loop().run_in_executor(
                     None, _fetch_candles, after_ms
@@ -134,12 +146,13 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
                 break
             except Exception as e:
                 retries += 1
-                delay = min(2.0 * (2 ** retries), 30.0)
-                logger.warning(f"OKX fetch error (retry {retries}): {e}, wait {delay:.0f}s")
+                last_error = str(e)
+                delay = min(2.0 * (2 ** retries), 15.0)
+                logger.warning(f"OKX fetch error (retry {retries}/4): {e}, wait {delay:.0f}s")
                 await asyncio.sleep(delay)
 
         if payload is None:
-            raise RuntimeError("OKX download failed after max retries")
+            raise RuntimeError(f"OKX download failed after 4 retries. Last error: {last_error}")
 
         data = payload.get("data", [])
         if not data:
@@ -164,6 +177,11 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
         # Paginate backwards — oldest ts in this batch
         after_ms = int(data[-1][0])
         batch += 1
+
+        # Report download progress
+        download_pct = min(batch / est_total_batches, 0.95)
+        if progress_callback:
+            progress_callback(download_pct * 0.5)  # download phase = 0-50% of total
         if batch % 50 == 0:
             pct = max(0.0, (now_ms - after_ms) / (now_ms - cutoff_ms) * 100)
             logger.info(
@@ -547,30 +565,30 @@ async def run_backtest(
     Returns:
         Dict with comprehensive backtest results including alert flags
     """
-    # Step 1: Download historical ticks
-    ticks: List[dict] = await download_historical_ticks(config.historical_data_days)
+    # Step 1: Download historical ticks (0–50% progress)
+    ticks: List[dict] = await download_historical_ticks(
+        config.historical_data_days,
+        progress_callback=progress_callback,
+    )
 
     if not ticks:
-        return {
-            "total_windows": 0, "total_trades": 0, "wins": 0, "losses": 0,
-            "win_rate": 0.0, "avg_edge": 0.0, "sharpe_ratio": 0.0,
-            "max_drawdown": 0.0, "net_return": 0.0,
-            "final_balance": config.starting_capital,
-            "daily_expectancy": 0.0, "avg_kelly": 0.0,
-            "trades": [], "equity_curve": [],
-            "alert_win_rate": True, "alert_expectancy": True,
-        }
+        raise RuntimeError(
+            f"No candle data returned from OKX for {config.historical_data_days} days. "
+            "Check network connectivity."
+        )
 
     # Step 2: Slice into 5-minute windows
     windows: List[List[dict]] = slice_into_windows(ticks)
 
-    # Step 3: Simulate each window
+    # Step 3: Simulate each window (50–100% progress)
     raw_trades: List[dict] = []
     total_windows: int = len(windows)
 
     for i, window in enumerate(windows):
         if progress_callback and i % 100 == 0:
-            progress_callback(i / max(total_windows, 1))
+            # Simulation runs from 50% to 100%
+            sim_pct = 0.5 + 0.5 * (i / max(total_windows, 1))
+            progress_callback(sim_pct)
 
         trade: Optional[dict] = simulate_window(window, config)
         if trade is not None:
@@ -968,20 +986,19 @@ async def run_real_backtest(
 
     # Phase 1: Download BTC ticks (0–10% progress)
     logger.info("Real backtest — Phase 1: Downloading BTC ticks...")
-    ticks: List[dict] = await download_historical_ticks(days)
+
+    def _dl_progress(pct: float) -> None:
+        """Map download progress (0-1) into 0-10% of overall."""
+        if progress_callback:
+            progress_callback(pct * 0.1)
+
+    ticks: List[dict] = await download_historical_ticks(days, progress_callback=_dl_progress)
 
     if not ticks:
-        return {
-            "total_windows": 0, "total_trades": 0, "wins": 0, "losses": 0,
-            "win_rate": 0.0, "avg_edge": 0.0, "sharpe_ratio": 0.0,
-            "max_drawdown": 0.0, "net_return": 0.0,
-            "final_balance": config.starting_capital,
-            "daily_expectancy": 0.0, "avg_kelly": 0.0,
-            "trades": [], "equity_curve": [],
-            "alert_win_rate": True, "alert_expectancy": True,
-            "alert_no_markets": True,
-            "data_source": "polymarket_clob",
-        }
+        raise RuntimeError(
+            f"No candle data returned from OKX for {days} days. "
+            "Check network connectivity."
+        )
 
     if progress_callback:
         progress_callback(0.1)

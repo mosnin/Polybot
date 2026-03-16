@@ -336,6 +336,64 @@ def _render_backtest_tab() -> None:
         finally:
             st.session_state.backtest_running = False
 
+    # --- Real Polymarket Backtest ---
+    st.divider()
+    st.subheader("Real Polymarket Data Backtest")
+    st.caption(
+        "Uses actual historical Polymarket CLOB prices and market resolutions "
+        "instead of synthesized data. Queries Gamma API for past 5-min BTC "
+        "markets and CLOB /prices-history for real share prices."
+    )
+
+    if "real_backtest_running" not in st.session_state:
+        st.session_state.real_backtest_running = False
+
+    if st.button(
+        "Run Real Polymarket Backtest",
+        type="primary",
+        use_container_width=True,
+        disabled=st.session_state.real_backtest_running,
+        key="real_backtest_btn",
+    ):
+        st.session_state.real_backtest_running = True
+        st.session_state.backtest_result = None
+
+        real_progress = st.progress(0.0, text="Discovering real Polymarket markets...")
+        real_status = st.empty()
+
+        def real_update_progress(pct: float) -> None:
+            real_progress.progress(
+                min(pct, 1.0),
+                text=f"Processing real market data... {pct * 100:.0f}%",
+            )
+
+        try:
+            import asyncio as _asyncio
+
+            from backtest import run_real_backtest
+            from config import load_config
+
+            config = load_config()
+            real_status.info(
+                "Fetching real Polymarket data (this may take 3-5 minutes)..."
+            )
+            result = _asyncio.run(
+                run_real_backtest(config, progress_callback=real_update_progress)
+            )
+            st.session_state.backtest_result = result
+            real_progress.progress(1.0, text="Real backtest complete!")
+            real_status.empty()
+
+            if result.get("alert_no_markets"):
+                st.warning(
+                    "No real Polymarket 5-min BTC markets found for the requested "
+                    "period. Use the standard backtest (Binance data) as fallback."
+                )
+        except Exception as e:
+            st.error(f"Real backtest failed: {e}")
+        finally:
+            st.session_state.real_backtest_running = False
+
     # Display results if available
     result = st.session_state.backtest_result
     if result is None:

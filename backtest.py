@@ -5,9 +5,13 @@ Downloads 30 days of 1-second BTC ticks via ccxt, replays every 5-minute
 window through the full Bayesian + z-score + Monte Carlo pipeline, and
 outputs comprehensive performance metrics.
 
-This module is self-contained — it reuses BayesianModel from model.py
-but requires no CLOB connection, wallet, or live executor. Everything is
-simulated from historical price data.
+Supports two modes:
+1. **Synthetic backtest** (``run_backtest``): Uses Binance perpetual ticks with
+   synthesized implied probabilities.  Fast (~30 s), no CLOB connection needed.
+2. **Real Polymarket backtest** (``run_real_backtest``): Discovers actual past
+   5-min BTC markets via Gamma API, fetches real CLOB price history, and uses
+   real market resolutions as ground truth.  Slower (~3–5 min) but fully
+   authentic.
 
 Exit criteria for live deployment:
 - Win rate >= 58% (edge above costs with margin of safety)
@@ -21,9 +25,10 @@ Usage:
 
     # Programmatic (from dashboard)
     import asyncio
-    from backtest import run_backtest
+    from backtest import run_backtest, run_real_backtest
     from config import load_config
     result = asyncio.run(run_backtest(load_config()))
+    result = asyncio.run(run_real_backtest(load_config()))
 """
 
 import asyncio
@@ -35,6 +40,7 @@ import time
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 
 from config import Config, load_config
@@ -345,6 +351,142 @@ def _compute_max_drawdown(equity_curve: List[Tuple[float, float]]) -> float:
     return max_dd
 
 
+def _compute_backtest_metrics(
+    trades: List[dict],
+    total_windows: int,
+    config: Config,
+    initial_timestamp: Optional[int] = None,
+    data_source: str = "binance_synthetic",
+) -> dict:
+    """Compute backtest summary metrics from a list of raw trade signals.
+
+    Applies Kelly-based position sizing, computes P&L, builds equity curve,
+    and derives all performance statistics.  Shared between ``run_backtest``
+    and ``run_real_backtest``.
+
+    Args:
+        trades: List of raw trade dicts (must have ``kelly_fraction``, ``edge``,
+                ``won``, ``timestamp``).  Modified in-place with P&L fields.
+        total_windows: Total number of windows analyzed
+        config: Bot configuration for sizing / cost parameters
+        initial_timestamp: First timestamp for equity curve anchor (ms)
+        data_source: Label for the data source
+
+    Returns:
+        Complete result dict with all metrics + alert flags
+    """
+    balance: float = config.starting_capital
+    equity_curve: List[Tuple[float, float]] = []
+    if initial_timestamp is not None:
+        equity_curve.append((initial_timestamp, balance))
+
+    daily_balances: Dict[str, List[float]] = defaultdict(list)
+    sized_trades: List[dict] = []
+
+    for trade in trades:
+        if balance <= config.safety_floor_usdc:
+            break
+
+        kelly: float = trade["kelly_fraction"]
+        available: float = balance - config.safety_floor_usdc - config.gas_buffer_usdc
+        if available <= 0:
+            continue
+
+        position_size: float = available * kelly * config.max_exposure_pct
+        position_size = min(position_size, available)
+        position_size = max(position_size, 0.0)
+
+        if trade["won"]:
+            pnl: float = position_size * trade["edge"]
+        else:
+            pnl = -position_size * config.round_trip_cost_pct
+
+        pnl -= config.gas_buffer_usdc
+
+        trade["pnl"] = pnl
+        trade["position_size"] = position_size
+        trade["balance_before"] = balance
+
+        balance += pnl
+        balance = max(balance, 0.0)
+
+        trade["balance_after"] = balance
+        sized_trades.append(trade)
+
+        equity_curve.append((trade["timestamp"], balance))
+
+        day_str: str = datetime.datetime.fromtimestamp(
+            trade["timestamp"] / 1000.0
+        ).strftime("%Y-%m-%d")
+        daily_balances[day_str].append(balance)
+
+    wins: int = sum(1 for t in sized_trades if t["won"])
+    losses: int = len(sized_trades) - wins
+    win_rate: float = wins / max(len(sized_trades), 1)
+
+    avg_edge: float = (
+        sum(t["edge"] for t in sized_trades) / len(sized_trades)
+        if sized_trades else 0.0
+    )
+    avg_kelly: float = (
+        sum(t["kelly_fraction"] for t in sized_trades) / len(sized_trades)
+        if sized_trades else 0.0
+    )
+
+    daily_returns: List[float] = []
+    sorted_days: List[str] = sorted(daily_balances.keys())
+    prev_day_balance: float = config.starting_capital
+    for day in sorted_days:
+        end_balance: float = daily_balances[day][-1]
+        if prev_day_balance > 0:
+            daily_ret: float = (end_balance - prev_day_balance) / prev_day_balance
+            daily_returns.append(daily_ret)
+        prev_day_balance = end_balance
+
+    sharpe: float = _compute_sharpe(daily_returns)
+    max_dd: float = _compute_max_drawdown(equity_curve)
+    net_return: float = (
+        (balance - config.starting_capital) / config.starting_capital
+        if config.starting_capital > 0 else 0.0
+    )
+
+    daily_expectancy: float = (
+        sum(daily_returns) / len(daily_returns) if daily_returns else 0.0
+    )
+
+    alert_win_rate: bool = win_rate < 0.58
+    alert_expectancy: bool = daily_expectancy < 0.008
+
+    result: dict = {
+        "total_windows": total_windows,
+        "total_trades": len(sized_trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "avg_edge": avg_edge,
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max_dd,
+        "net_return": net_return,
+        "final_balance": balance,
+        "daily_expectancy": daily_expectancy,
+        "avg_kelly": avg_kelly,
+        "trades": sized_trades,
+        "equity_curve": equity_curve,
+        "alert_win_rate": alert_win_rate,
+        "alert_expectancy": alert_expectancy,
+        "data_source": data_source,
+    }
+
+    logger.info(
+        f"Backtest complete ({data_source}): {len(sized_trades)} trades over "
+        f"{total_windows} windows | Win rate: {win_rate:.1%} | "
+        f"Sharpe: {sharpe:.2f} | Max DD: {max_dd:.1%} | "
+        f"Net return: {net_return:.1%} | Final balance: ${balance:.2f}"
+    )
+
+    return result
+
+
 async def run_backtest(
     config: Config,
     progress_callback: Optional[Callable[[float], None]] = None,
@@ -380,137 +522,541 @@ async def run_backtest(
     windows: List[List[dict]] = slice_into_windows(ticks)
 
     # Step 3: Simulate each window
-    trades: List[dict] = []
-    balance: float = config.starting_capital
-    equity_curve: List[Tuple[float, float]] = [(ticks[0]["timestamp"], balance)]
-
-    # Daily balance tracking for Sharpe calculation
-    daily_balances: Dict[str, List[float]] = defaultdict(list)
-
+    raw_trades: List[dict] = []
     total_windows: int = len(windows)
+
     for i, window in enumerate(windows):
-        # Progress callback every 100 windows
         if progress_callback and i % 100 == 0:
             progress_callback(i / max(total_windows, 1))
 
-        # Safety floor check — skip if below floor
-        if balance <= config.safety_floor_usdc:
-            break
-
         trade: Optional[dict] = simulate_window(window, config)
-
         if trade is not None:
-            # Compute P&L using Kelly-sized position (mirrors live sizing logic)
-            kelly: float = trade["kelly_fraction"]
-            available: float = balance - config.safety_floor_usdc - config.gas_buffer_usdc
-            if available <= 0:
-                continue
+            raw_trades.append(trade)
 
-            position_size: float = available * kelly * config.max_exposure_pct
-            position_size = min(position_size, available)
-            position_size = max(position_size, 0.0)
-
-            if trade["won"]:
-                pnl: float = position_size * trade["edge"]
-            else:
-                pnl = -position_size * config.round_trip_cost_pct
-
-            # Deduct gas cost per trade
-            pnl -= config.gas_buffer_usdc
-
-            trade["pnl"] = pnl
-            trade["position_size"] = position_size
-            trade["balance_before"] = balance
-
-            balance += pnl
-            balance = max(balance, 0.0)  # can't go negative
-
-            trade["balance_after"] = balance
-            trades.append(trade)
-
-            # Track equity curve
-            equity_curve.append((trade["timestamp"], balance))
-
-            # Track daily balance for Sharpe
-            day_str: str = datetime.datetime.fromtimestamp(
-                trade["timestamp"] / 1000.0
-            ).strftime("%Y-%m-%d")
-            daily_balances[day_str].append(balance)
-
-    # Final progress
     if progress_callback:
         progress_callback(1.0)
 
-    # Step 4: Compute metrics
-    wins: int = sum(1 for t in trades if t["won"])
-    losses: int = len(trades) - wins
-    win_rate: float = wins / max(len(trades), 1)
-
-    avg_edge: float = (
-        sum(t["edge"] for t in trades) / len(trades) if trades else 0.0
-    )
-    avg_kelly: float = (
-        sum(t["kelly_fraction"] for t in trades) / len(trades) if trades else 0.0
+    # Step 4: Compute metrics via shared function
+    return _compute_backtest_metrics(
+        trades=raw_trades,
+        total_windows=total_windows,
+        config=config,
+        initial_timestamp=ticks[0]["timestamp"],
+        data_source="binance_synthetic",
     )
 
-    # Sharpe ratio from daily returns
-    daily_returns: List[float] = []
-    sorted_days: List[str] = sorted(daily_balances.keys())
-    prev_day_balance: float = config.starting_capital
-    for day in sorted_days:
-        end_balance: float = daily_balances[day][-1]
-        if prev_day_balance > 0:
-            daily_ret: float = (end_balance - prev_day_balance) / prev_day_balance
-            daily_returns.append(daily_ret)
-        prev_day_balance = end_balance
 
-    sharpe: float = _compute_sharpe(daily_returns)
-    max_dd: float = _compute_max_drawdown(equity_curve)
-    net_return: float = (
-        (balance - config.starting_capital) / config.starting_capital
-        if config.starting_capital > 0 else 0.0
-    )
+# ---------------------------------------------------------------------------
+# 5. Real Polymarket Data Backtest
+# ---------------------------------------------------------------------------
 
-    # Daily expectancy: average daily return
-    daily_expectancy: float = (
-        sum(daily_returns) / len(daily_returns) if daily_returns else 0.0
-    )
+GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"
+CLOB_API_BASE: str = "https://clob.polymarket.com"
+SLUG_PREFIX: str = "btc-updown-5m-"
 
-    # Alert thresholds
-    alert_win_rate: bool = win_rate < 0.58
-    alert_expectancy: bool = daily_expectancy < 0.008  # 0.8%
 
-    result: dict = {
-        "total_windows": total_windows,
-        "total_trades": len(trades),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "avg_edge": avg_edge,
-        "sharpe_ratio": sharpe,
-        "max_drawdown": max_dd,
-        "net_return": net_return,
-        "final_balance": balance,
-        "daily_expectancy": daily_expectancy,
-        "avg_kelly": avg_kelly,
-        "trades": trades,
-        "equity_curve": equity_curve,
-        "alert_win_rate": alert_win_rate,
-        "alert_expectancy": alert_expectancy,
-    }
+def _real_markets_cache_path(days: int) -> str:
+    return os.path.join(CACHE_DIR, f"polybot_real_markets_{days}d.json")
+
+
+def _clob_prices_cache_path(days: int) -> str:
+    return os.path.join(CACHE_DIR, f"polybot_clob_prices_{days}d.json")
+
+
+async def discover_real_markets(
+    days: int = 30,
+    concurrency: int = 20,
+    progress_callback: Optional[Callable[[float], None]] = None,
+) -> List[dict]:
+    """Enumerate past 5-min BTC markets via Gamma API slug lookup.
+
+    Generates deterministic slugs for every 5-min window in the requested
+    time range and queries the Gamma API for each.  Markets that existed
+    are returned with token IDs and resolution outcomes.
+
+    Args:
+        days: Number of historical days to scan
+        concurrency: Max concurrent HTTP requests to Gamma API
+        progress_callback: Optional progress reporter (0.0–1.0)
+
+    Returns:
+        List of dicts with keys: slug, market_id, yes_token_id,
+        no_token_id, start_ts, end_ts, resolution ("YES" or "NO")
+    """
+    cache_file: str = _real_markets_cache_path(days)
+    if _cache_is_valid(cache_file):
+        logger.info(f"Loading cached real market data from {cache_file}")
+        with open(cache_file, "r") as f:
+            return json.load(f)
+
+    now: int = int(time.time())
+    start: int = now - days * 86400
+    # Align to 5-min boundaries
+    start = (start // WINDOW_SECONDS) * WINDOW_SECONDS
+
+    slugs: List[Tuple[str, int]] = []
+    ts: int = start
+    while ts < now:
+        slugs.append((f"{SLUG_PREFIX}{ts}", ts))
+        ts += WINDOW_SECONDS
 
     logger.info(
-        f"Backtest complete: {len(trades)} trades over {total_windows} windows | "
-        f"Win rate: {win_rate:.1%} | Sharpe: {sharpe:.2f} | "
-        f"Max DD: {max_dd:.1%} | Net return: {net_return:.1%} | "
-        f"Final balance: ${balance:.2f}"
+        f"Discovering real markets: {len(slugs)} possible 5-min windows "
+        f"over {days} days"
     )
+
+    markets: List[dict] = []
+    sem = asyncio.Semaphore(concurrency)
+    completed: int = 0
+    total: int = len(slugs)
+
+    async def _fetch_one(
+        session: aiohttp.ClientSession, slug: str, start_ts: int
+    ) -> Optional[dict]:
+        nonlocal completed
+        url: str = f"{GAMMA_API_BASE}/events/slug/{slug}"
+        for attempt in range(3):
+            try:
+                async with sem:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 404:
+                            return None
+                        if resp.status != 200:
+                            if attempt < 2:
+                                await asyncio.sleep(2.0 ** attempt)
+                                continue
+                            return None
+                        data = await resp.json()
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(2.0 ** attempt)
+                    continue
+                return None
+            finally:
+                completed += 1
+                if progress_callback and completed % 200 == 0:
+                    progress_callback(completed / total * 0.4)  # 0–40% for discovery
+
+            event_markets = data.get("markets") if isinstance(data, dict) else None
+            if not event_markets:
+                return None
+
+            mkt = event_markets[0]
+            # Parse token IDs (may be JSON string or list)
+            raw_tokens = mkt.get("clobTokenIds", [])
+            if isinstance(raw_tokens, str):
+                try:
+                    raw_tokens = json.loads(raw_tokens)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+            if len(raw_tokens) < 2:
+                return None
+
+            # Determine resolution from outcomePrices
+            outcome_prices = mkt.get("outcomePrices", [])
+            if isinstance(outcome_prices, str):
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+
+            resolution: Optional[str] = None
+            if len(outcome_prices) >= 2:
+                try:
+                    if float(outcome_prices[0]) > 0.5:
+                        resolution = "YES"
+                    elif float(outcome_prices[1]) > 0.5:
+                        resolution = "NO"
+                except (ValueError, TypeError):
+                    pass
+
+            if resolution is None:
+                return None  # Market not yet resolved
+
+            return {
+                "slug": slug,
+                "market_id": mkt.get("id", ""),
+                "yes_token_id": raw_tokens[0],
+                "no_token_id": raw_tokens[1],
+                "start_ts": start_ts,
+                "end_ts": start_ts + WINDOW_SECONDS,
+                "resolution": resolution,
+            }
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            _fetch_one(session, slug, start_ts)
+            for slug, start_ts in slugs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in results:
+        if isinstance(r, dict):
+            markets.append(r)
+
+    logger.info(f"Discovered {len(markets)} real markets out of {total} windows")
+
+    # Cache results
+    with open(cache_file, "w") as f:
+        json.dump(markets, f)
+
+    return markets
+
+
+async def fetch_clob_price_history(
+    markets: List[dict],
+    concurrency: int = 10,
+    progress_callback: Optional[Callable[[float], None]] = None,
+) -> Dict[str, List[dict]]:
+    """Fetch minute-by-minute CLOB share prices for each market's YES token.
+
+    Calls the official Polymarket CLOB ``/prices-history`` endpoint for each
+    discovered market to obtain the real implied-probability time series.
+
+    Args:
+        markets: List of market dicts from ``discover_real_markets``
+        concurrency: Max concurrent CLOB requests
+        progress_callback: Optional progress reporter (0.4–0.7 range)
+
+    Returns:
+        Dict mapping market slug → list of {"t": unix, "p": float}
+    """
+    if not markets:
+        return {}
+
+    # Check cache
+    days_approx: int = max(
+        1,
+        int((max(m["end_ts"] for m in markets) - min(m["start_ts"] for m in markets))
+            / 86400) + 1,
+    )
+    cache_file: str = _clob_prices_cache_path(days_approx)
+    if _cache_is_valid(cache_file):
+        logger.info(f"Loading cached CLOB price history from {cache_file}")
+        with open(cache_file, "r") as f:
+            return json.load(f)
+
+    logger.info(f"Fetching CLOB price history for {len(markets)} markets...")
+
+    price_data: Dict[str, List[dict]] = {}
+    sem = asyncio.Semaphore(concurrency)
+    completed: int = 0
+    total: int = len(markets)
+
+    async def _fetch_prices(
+        session: aiohttp.ClientSession, market: dict
+    ) -> Optional[Tuple[str, List[dict]]]:
+        nonlocal completed
+        token_id: str = market["yes_token_id"]
+        url: str = (
+            f"{CLOB_API_BASE}/prices-history"
+            f"?market={token_id}"
+            f"&startTs={market['start_ts']}"
+            f"&endTs={market['end_ts']}"
+            f"&fidelity=1"
+        )
+        for attempt in range(3):
+            try:
+                async with sem:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            if attempt < 2:
+                                await asyncio.sleep(2.0 ** attempt)
+                                continue
+                            return None
+                        data = await resp.json()
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(2.0 ** attempt)
+                    continue
+                return None
+            finally:
+                completed += 1
+                if progress_callback and completed % 50 == 0:
+                    progress_callback(0.4 + completed / total * 0.3)  # 40–70%
+
+            history = data.get("history", [])
+            if len(history) < 2:
+                return None
+
+            return (market["slug"], history)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [_fetch_prices(session, m) for m in markets]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in results:
+        if isinstance(r, tuple):
+            slug, history = r
+            price_data[slug] = history
+
+    logger.info(
+        f"Fetched CLOB prices for {len(price_data)} / {total} markets"
+    )
+
+    with open(cache_file, "w") as f:
+        json.dump(price_data, f)
+
+    return price_data
+
+
+def simulate_real_window(
+    btc_ticks: List[dict],
+    clob_prices: List[dict],
+    resolution: str,
+    config: Config,
+) -> Optional[dict]:
+    """Run the Bayesian + MC pipeline on one window using real CLOB data.
+
+    The BTC ticks drive ``model.update()`` (momentum estimation), while the
+    CLOB share price provides the real implied probability that the
+    synthesized version approximated.  The win/loss outcome is determined
+    by the actual market resolution, not a price comparison.
+
+    Args:
+        btc_ticks: Binance 1s BTC prices for this 5-min window
+        clob_prices: CLOB minute-by-minute prices [{"t": unix, "p": float}]
+        resolution: "YES" or "NO" — the actual market outcome
+        config: Bot configuration
+
+    Returns:
+        Trade result dict or None if no signal generated
+    """
+    model = BayesianModel(
+        min_edge=config.min_edge_threshold,
+        round_trip_cost=config.round_trip_cost_pct,
+        decay_factor=config.decay_factor,
+    )
+
+    n_ticks: int = len(btc_ticks)
+    eval_idx: int = int(n_ticks * 0.8)
+
+    if eval_idx < 5:
+        return None
+
+    prev_price: Optional[float] = None
+    for i in range(eval_idx):
+        price: float = btc_ticks[i]["price"]
+        model.update(price, prev_price)
+        prev_price = price
+
+    current_price: float = btc_ticks[eval_idx - 1]["price"]
+    remaining_seconds: float = float(n_ticks - eval_idx)
+
+    # Use real CLOB price as implied probability.
+    # Find the CLOB price point closest to the evaluation timestamp.
+    eval_ts: float = btc_ticks[eval_idx - 1]["timestamp"] / 1000.0
+    best_clob: Optional[dict] = None
+    best_dist: float = float("inf")
+    for cp in clob_prices:
+        dist: float = abs(cp["t"] - eval_ts)
+        if dist < best_dist:
+            best_dist = dist
+            best_clob = cp
+
+    if best_clob is None:
+        return None
+
+    # CLOB share price IS the implied probability for this binary market
+    implied_prob_up: float = float(best_clob["p"])
+    # Clamp to sane range to avoid degenerate edge calculations
+    implied_prob_up = max(0.01, min(0.99, implied_prob_up))
+
+    signal = model.evaluate(
+        current_price=current_price,
+        implied_prob_up=implied_prob_up,
+        remaining_seconds=max(remaining_seconds, 10.0),
+        order_book=None,
+    )
+
+    if signal is None:
+        return None
+
+    # Determine outcome from real market resolution
+    if signal.direction == "UP":
+        won: bool = resolution == "YES"
+    else:
+        won = resolution == "NO"
+
+    exit_price: float = btc_ticks[-1]["price"]
+
+    return {
+        "timestamp": btc_ticks[eval_idx - 1]["timestamp"],
+        "direction": signal.direction,
+        "edge": signal.edge,
+        "z_score": signal.z_score,
+        "mc_ev": signal.mc_ev,
+        "mc_win_prob": signal.mc_win_prob,
+        "kelly_fraction": signal.kelly_fraction,
+        "entry_price": current_price,
+        "exit_price": exit_price,
+        "implied_prob": implied_prob_up,
+        "won": won,
+    }
+
+
+async def run_real_backtest(
+    config: Config,
+    progress_callback: Optional[Callable[[float], None]] = None,
+) -> dict:
+    """Run backtest using real Polymarket CLOB data and market resolutions.
+
+    Pipeline:
+    1. Download Binance 1s ticks (reuse ``download_historical_ticks``)
+    2. Discover real Polymarket 5-min BTC markets via Gamma API
+    3. Fetch CLOB price history for each discovered market
+    4. Align BTC ticks with CLOB windows
+    5. Simulate each window with real implied probabilities + resolutions
+    6. Compute metrics via shared ``_compute_backtest_metrics``
+
+    The result dict is compatible with ``run_backtest`` output, so the
+    dashboard can render it identically.
+
+    Args:
+        config: Bot configuration
+        progress_callback: Optional progress reporter (0.0–1.0)
+
+    Returns:
+        Dict with comprehensive backtest results including alert flags.
+        Includes ``data_source: "polymarket_clob"`` and
+        ``alert_no_markets: True`` if no real markets were found.
+    """
+    days: int = config.historical_data_days
+
+    # Phase 1: Download BTC ticks (0–10% progress)
+    logger.info("Real backtest — Phase 1: Downloading BTC ticks...")
+    ticks: List[dict] = await download_historical_ticks(days)
+
+    if not ticks:
+        return {
+            "total_windows": 0, "total_trades": 0, "wins": 0, "losses": 0,
+            "win_rate": 0.0, "avg_edge": 0.0, "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0, "net_return": 0.0,
+            "final_balance": config.starting_capital,
+            "daily_expectancy": 0.0, "avg_kelly": 0.0,
+            "trades": [], "equity_curve": [],
+            "alert_win_rate": True, "alert_expectancy": True,
+            "alert_no_markets": True,
+            "data_source": "polymarket_clob",
+        }
+
+    if progress_callback:
+        progress_callback(0.1)
+
+    # Phase 2: Discover real markets (10–50% progress)
+    logger.info("Real backtest — Phase 2: Discovering real Polymarket markets...")
+    real_markets: List[dict] = await discover_real_markets(
+        days=days,
+        concurrency=20,
+        progress_callback=progress_callback,
+    )
+
+    if not real_markets:
+        logger.warning("No real Polymarket 5-min BTC markets found")
+        return {
+            "total_windows": 0, "total_trades": 0, "wins": 0, "losses": 0,
+            "win_rate": 0.0, "avg_edge": 0.0, "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0, "net_return": 0.0,
+            "final_balance": config.starting_capital,
+            "daily_expectancy": 0.0, "avg_kelly": 0.0,
+            "trades": [], "equity_curve": [],
+            "alert_win_rate": True, "alert_expectancy": True,
+            "alert_no_markets": True,
+            "data_source": "polymarket_clob",
+        }
+
+    if progress_callback:
+        progress_callback(0.5)
+
+    # Phase 3: Fetch CLOB price histories (50–80% progress)
+    logger.info("Real backtest — Phase 3: Fetching CLOB price histories...")
+    clob_prices: Dict[str, List[dict]] = await fetch_clob_price_history(
+        markets=real_markets,
+        concurrency=10,
+        progress_callback=progress_callback,
+    )
+
+    if progress_callback:
+        progress_callback(0.8)
+
+    # Phase 4: Slice BTC ticks and align with real markets
+    logger.info("Real backtest — Phase 4: Aligning BTC ticks with real markets...")
+    btc_windows: Dict[int, List[dict]] = {}
+    for tick in ticks:
+        ts_sec: float = tick["timestamp"] / 1000.0
+        window_key: int = int(ts_sec // WINDOW_SECONDS) * WINDOW_SECONDS
+        if window_key not in btc_windows:
+            btc_windows[window_key] = []
+        btc_windows[window_key].append(tick)
+
+    # Phase 5: Simulate each matched window
+    logger.info("Real backtest — Phase 5: Simulating matched windows...")
+    raw_trades: List[dict] = []
+    matched_count: int = 0
+
+    # Sort markets chronologically for consistent equity curve
+    real_markets.sort(key=lambda m: m["start_ts"])
+
+    for mkt in real_markets:
+        slug: str = mkt["slug"]
+        start_ts: int = mkt["start_ts"]
+
+        # Need both BTC ticks and CLOB prices for this window
+        if slug not in clob_prices:
+            continue
+        if start_ts not in btc_windows:
+            continue
+
+        window_btc = btc_windows[start_ts]
+        if len(window_btc) < MIN_TICKS_PER_WINDOW:
+            continue
+
+        # Sort ticks chronologically within window
+        window_btc.sort(key=lambda t: t["timestamp"])
+
+        trade: Optional[dict] = simulate_real_window(
+            btc_ticks=window_btc,
+            clob_prices=clob_prices[slug],
+            resolution=mkt["resolution"],
+            config=config,
+        )
+
+        if trade is not None:
+            raw_trades.append(trade)
+        matched_count += 1
+
+    logger.info(
+        f"Real backtest: {matched_count} windows matched, "
+        f"{len(raw_trades)} signals generated"
+    )
+
+    if progress_callback:
+        progress_callback(0.95)
+
+    # Phase 6: Compute metrics
+    result = _compute_backtest_metrics(
+        trades=raw_trades,
+        total_windows=matched_count,
+        config=config,
+        initial_timestamp=ticks[0]["timestamp"] if ticks else None,
+        data_source="polymarket_clob",
+    )
+
+    result["real_markets_found"] = len(real_markets)
+    result["clob_prices_fetched"] = len(clob_prices)
+    result["windows_matched"] = matched_count
+
+    if matched_count == 0:
+        result["alert_no_markets"] = True
+
+    if progress_callback:
+        progress_callback(1.0)
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# 5. CLI Entry Point
+# 6. CLI Entry Point
 # ---------------------------------------------------------------------------
 
 

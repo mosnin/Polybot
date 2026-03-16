@@ -566,3 +566,53 @@ class BayesianModel:
             kelly_fraction=kelly,
             computation_ms=elapsed_ms,
         )
+
+    def check_market_making_opportunity(
+        self,
+        yes_midpoint: float,
+        no_midpoint: float,
+        spread_threshold: float = 0.99,
+    ) -> Optional[dict]:
+        """Check if YES + NO midpoints create a market-making spread.
+
+        When the sum of midpoints < threshold, buying both sides locks in
+        guaranteed value (1.00 payout on one side, minus cost of both).
+        The spread = 1.00 - (yes_mid + no_mid) is the raw profit before costs.
+
+        Args:
+            yes_midpoint: Current CLOB midpoint for YES token (0.0–1.0)
+            no_midpoint: Current CLOB midpoint for NO token (0.0–1.0)
+            spread_threshold: Trigger when sum < this (default 0.99)
+
+        Returns:
+            Dict with spread metrics if opportunity found, None otherwise.
+            Keys: spread, yes_price, no_price, expected_profit, mid_sum
+        """
+        mid_sum: float = yes_midpoint + no_midpoint
+        if mid_sum >= spread_threshold:
+            return None
+
+        spread: float = 1.0 - mid_sum
+
+        # Order prices: one tick below each midpoint (maker side)
+        yes_price: float = round(yes_midpoint - 0.01, 2)
+        no_price: float = round(no_midpoint - 0.01, 2)
+
+        # Clamp to valid range
+        yes_price = max(0.01, min(0.99, yes_price))
+        no_price = max(0.01, min(0.99, no_price))
+
+        # Expected profit: 1.00 payout - cost of both sides - round-trip costs
+        cost: float = yes_price + no_price
+        expected_profit: float = 1.0 - cost - self.round_trip_cost
+
+        if expected_profit <= 0:
+            return None  # spread doesn't cover costs
+
+        return {
+            "spread": spread,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "expected_profit": expected_profit,
+            "mid_sum": mid_sum,
+        }

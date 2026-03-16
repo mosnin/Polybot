@@ -71,6 +71,10 @@ class BotState:
     is_paused: bool = False
     compounding_active: bool = False
     test_mode: bool = False
+    # Market-making state
+    mm_trades: int = 0
+    mm_spread_profit: float = 0.0
+    mm_active: bool = False
     # Balance history for daily return calculation (compounding gate).
     # Stores (unix_timestamp, balance) tuples. Capped at 50k entries (~14 hours).
     equity_history: List[Tuple[float, float]] = field(default_factory=list)
@@ -162,6 +166,15 @@ class AsyncBot:
         # Alert state flags (prevent repeated emails)
         self._drawdown_alert_sent: bool = False
         self._latency_alert_sent: bool = False
+
+        # Market-making state
+        self._mm_active: bool = False
+        self._mm_yes_order: Optional[OrderResult] = None
+        self._mm_no_order: Optional[OrderResult] = None
+        self._mm_entry_time: float = 0.0
+        self._mm_spread_profit: float = 0.0
+        self._last_mm_check: float = 0.0
+        self._mm_pending_cancel: bool = False
 
         # Redis connection for equity history + bot state persistence (optional).
         # Shares the same Redis URL as the model for state continuity across restarts.
@@ -612,6 +625,217 @@ class AsyncBot:
             await asyncio.sleep(self.config.stale_order_cancel_interval)
             await loop.run_in_executor(None, self.executor.cancel_stale_orders)
 
+    async def _check_mm_opportunity(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> bool:
+        """Check for and execute a market-making spread opportunity.
+
+        Fetches both YES and NO midpoints in parallel, checks if their sum
+        is below the MM threshold (default 0.99), and places simultaneous
+        maker limit BUYs on both sides if the spread covers costs.
+
+        Throttled internally to run at most every ``mm_check_interval_secs``.
+        Prioritized before directional trading — if MM triggers, directional
+        logic is skipped for this cycle.
+
+        Returns:
+            True if MM trade was placed (caller should skip directional)
+        """
+        if not self.config.mm_enabled:
+            return False
+        if self.current_market is None:
+            return False
+        if self._mm_active:
+            return False  # already in an MM position
+
+        now: float = time.time()
+        if now - self._last_mm_check < self.config.mm_check_interval_secs:
+            return False
+        self._last_mm_check = now
+
+        remaining: float = self.current_market.end_timestamp - now
+        if remaining < self.config.mm_min_remaining_secs:
+            return False
+
+        # Fetch both midpoints in parallel
+        try:
+            yes_mid, no_mid = await asyncio.gather(
+                loop.run_in_executor(
+                    None, self.executor.get_midpoint,
+                    self.current_market.yes_token_id,
+                ),
+                loop.run_in_executor(
+                    None, self.executor.get_midpoint,
+                    self.current_market.no_token_id,
+                ),
+            )
+            yes_mid = float(yes_mid)
+            no_mid = float(no_mid)
+            self._consecutive_api_failures = 0
+        except Exception as e:
+            self.logger.warning(f"MM midpoint fetch failed: {e}")
+            return False
+
+        mm_signal = self.model.check_market_making_opportunity(
+            yes_midpoint=yes_mid,
+            no_midpoint=no_mid,
+            spread_threshold=self.config.mm_spread_threshold,
+        )
+
+        if mm_signal is None:
+            return False
+
+        self.logger.info(
+            f"MM OPPORTUNITY: spread={mm_signal['spread']:.4f} "
+            f"YES={yes_mid:.3f} NO={no_mid:.3f} "
+            f"expected_profit={mm_signal['expected_profit']:.4f}"
+        )
+
+        if self.state.test_mode:
+            self.logger.info("[TEST MODE] MM opportunity detected, not placing orders")
+            return True
+
+        # Place both sides
+        yes_order, no_order = await loop.run_in_executor(
+            None,
+            self.executor.place_mm_pair,
+            self.current_market.yes_token_id,
+            self.current_market.no_token_id,
+            mm_signal["yes_price"],
+            mm_signal["no_price"],
+            self.state.current_balance,
+            self.config.mm_exposure_pct,
+        )
+
+        if yes_order is None and no_order is None:
+            self.logger.warning("MM: both orders failed, aborting")
+            return False
+
+        # If only one side placed, cancel it — partial MM is not allowed
+        if yes_order is None or no_order is None:
+            orphan = yes_order or no_order
+            await loop.run_in_executor(
+                None, self.executor.cancel_order, orphan.order_id
+            )
+            self.logger.warning("MM: only one leg placed, cancelled orphan")
+            return False
+
+        self._mm_active = True
+        self._mm_yes_order = yes_order
+        self._mm_no_order = no_order
+        self._mm_entry_time = time.time()
+        self._mm_pending_cancel = False
+        self.state.mm_active = True
+        self.state.mm_trades += 1
+        self.state.total_trades += 1
+
+        # Push MM trade event to dashboard
+        self._push_event({
+            "type": "trade",
+            "timestamp": time.time(),
+            "direction": "MM-SPREAD",
+            "edge": mm_signal["spread"],
+            "z_score": 0.0,
+            "model_prob": 0.0,
+            "implied_prob": mm_signal["mid_sum"],
+            "kelly_fraction": 0.0,
+            "fill_price": mm_signal["yes_price"] + mm_signal["no_price"],
+            "size": yes_order.size + no_order.size,
+            "mc_ev": mm_signal["expected_profit"],
+            "outcome": None,
+            "gas_paid": self.config.gas_buffer_usdc * 2,
+            "net_pnl": None,
+            "mm_spread": mm_signal["spread"],
+        })
+
+        return True
+
+    async def _manage_mm_position(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        """Manage an active MM position: cancel the losing side after delay.
+
+        Called every cycle when ``_mm_active`` is True. After
+        ``mm_cancel_delay_secs`` (default 45s), the Bayesian model's
+        directional estimate determines which side to keep. The loser is
+        cancelled and the winner rides out with the original directional
+        logic (via ``_pending_prediction``).
+
+        Safety: if the window is about to expire (<15s remaining), both
+        sides are cancelled to avoid stuck positions.
+        """
+        if not self._mm_active:
+            return
+
+        elapsed: float = time.time() - self._mm_entry_time
+
+        # After cancel delay, determine winner and cancel loser
+        if elapsed >= self.config.mm_cancel_delay_secs and not self._mm_pending_cancel:
+            self._mm_pending_cancel = True
+
+            # Use the Bayesian model's current directional estimate
+            if self.model.true_prob_up >= 0.5:
+                cancel_order = self._mm_no_order
+                keep_direction = "UP"
+            else:
+                cancel_order = self._mm_yes_order
+                keep_direction = "DOWN"
+
+            await loop.run_in_executor(
+                None, self.executor.cancel_order, cancel_order.order_id
+            )
+
+            # Compute spread profit locked in by buying both sides
+            spread_pnl: float = (
+                1.0
+                - (self._mm_yes_order.price + self._mm_no_order.price)
+                - self.config.round_trip_cost_pct
+                - self.config.gas_buffer_usdc * 2
+            )
+            position_value: float = min(
+                self._mm_yes_order.size * self._mm_yes_order.price,
+                self._mm_no_order.size * self._mm_no_order.price,
+            )
+            spread_pnl_usdc: float = spread_pnl * position_value
+
+            self._mm_spread_profit += spread_pnl_usdc
+            self.state.mm_spread_profit += spread_pnl_usdc
+
+            self.logger.info(
+                f"MM CANCEL: dropped {cancel_order.token_id[:12]}... "
+                f"keeping {keep_direction} side | "
+                f"spread P&L: ${spread_pnl_usdc:.4f}"
+            )
+
+            # Record pending prediction so the kept side resolves like a directional trade
+            self._pending_prediction = {
+                "direction": keep_direction,
+                "entry_price": self.last_price,
+            }
+
+            # Reset MM state
+            self._mm_active = False
+            self._mm_yes_order = None
+            self._mm_no_order = None
+            self.state.mm_active = False
+            return
+
+        # Safety: if window is about to expire, cancel both sides
+        if self.current_market is not None:
+            remaining: float = self.current_market.end_timestamp - time.time()
+            if remaining < 15.0:
+                self.logger.warning("MM: window expiring, cancelling both sides")
+                await loop.run_in_executor(
+                    None, self.executor.cancel_order, self._mm_yes_order.order_id
+                )
+                await loop.run_in_executor(
+                    None, self.executor.cancel_order, self._mm_no_order.order_id
+                )
+                self._mm_active = False
+                self._mm_yes_order = None
+                self._mm_no_order = None
+                self.state.mm_active = False
+
     async def _trade_loop(self) -> None:
         """Main tick-to-decision pipeline. The core trading loop.
 
@@ -722,177 +946,171 @@ class AsyncBot:
             if self._check_streak():
                 continue
 
-            # Step 5: Get implied probability + order book in parallel
-            # Parallelizing these two HTTP calls via asyncio.gather keeps
-            # total I/O at max(midpoint_ms, orderbook_ms) instead of the sum,
-            # preserving the <80ms cycle target.
-            try:
-                token_id_for_fetch: str = self.current_market.yes_token_id
-                midpoint_result, order_book = await asyncio.gather(
-                    loop.run_in_executor(
-                        None,
-                        self.executor.get_midpoint,
-                        token_id_for_fetch,
-                    ),
-                    loop.run_in_executor(
-                        None,
-                        self.executor.get_order_book,
-                        token_id_for_fetch,
-                    ),
+            # Step 4b: Market-making spread check (prioritized before directional)
+            # Manages existing MM position if active, then checks for new opportunity.
+            if self._mm_active:
+                await self._manage_mm_position(loop)
+
+            mm_triggered: bool = await self._check_mm_opportunity(loop)
+            if mm_triggered:
+                cycle_ms = (time.perf_counter() - cycle_start) * 1000
+                signal = None  # no directional signal on MM cycles
+
+            if not mm_triggered:
+                # Step 5: Get implied probability + order book in parallel
+                # Parallelizing these two HTTP calls via asyncio.gather keeps
+                # total I/O at max(midpoint_ms, orderbook_ms) instead of the sum,
+                # preserving the <80ms cycle target.
+                try:
+                    token_id_for_fetch: str = self.current_market.yes_token_id
+                    midpoint_result, order_book = await asyncio.gather(
+                        loop.run_in_executor(
+                            None,
+                            self.executor.get_midpoint,
+                            token_id_for_fetch,
+                        ),
+                        loop.run_in_executor(
+                            None,
+                            self.executor.get_order_book,
+                            token_id_for_fetch,
+                        ),
+                    )
+                    implied_prob_up: float = float(midpoint_result)
+                except Exception as e:
+                    self.logger.error(f"Midpoint/orderbook fetch failed: {e}")
+                    self._consecutive_api_failures += 1
+                    if self._consecutive_api_failures >= self._CIRCUIT_BREAKER_THRESHOLD:
+                        self._circuit_breaker_until = time.time() + self._CIRCUIT_BREAKER_COOLDOWN
+                        self.logger.critical(
+                            f"CIRCUIT BREAKER: {self._consecutive_api_failures} consecutive "
+                            f"API failures. Cooling down for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
+                        )
+                        self._send_alert(
+                            "Circuit Breaker Activated",
+                            f"{self._consecutive_api_failures} consecutive API failures. "
+                            f"Trading paused for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
+                        )
+                    continue
+
+                # Step 6: Compute adaptive min-edge based on real-time CLOB depth.
+                dynamic_min_edge: float = adaptive_z_score(
+                    order_book,
+                    base_min_edge=self.config.min_edge_threshold,
+                    high_depth_threshold=self.config.rebate_depth_threshold,
                 )
-                implied_prob_up: float = float(midpoint_result)
-            except Exception as e:
-                self.logger.error(f"Midpoint/orderbook fetch failed: {e}")
-                self._consecutive_api_failures += 1
-                if self._consecutive_api_failures >= self._CIRCUIT_BREAKER_THRESHOLD:
-                    self._circuit_breaker_until = time.time() + self._CIRCUIT_BREAKER_COOLDOWN
-                    self.logger.critical(
-                        f"CIRCUIT BREAKER: {self._consecutive_api_failures} consecutive "
-                        f"API failures. Cooling down for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
-                    )
-                    self._send_alert(
-                        "Circuit Breaker Activated",
-                        f"{self._consecutive_api_failures} consecutive API failures. "
-                        f"Trading paused for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
-                    )
-                continue
 
-            # Step 6: Compute adaptive min-edge based on real-time CLOB depth.
-            # Deep books → lower threshold (more trades in liquid conditions).
-            # Thin books → higher threshold (conservative in low liquidity).
-            dynamic_min_edge: float = adaptive_z_score(
-                order_book,
-                base_min_edge=self.config.min_edge_threshold,
-                high_depth_threshold=self.config.rebate_depth_threshold,
-            )
+                # Run full evaluation pipeline with liquidity-aware z-score
+                signal: Optional[Signal] = self.model.evaluate(
+                    current_price=tick.last_price,
+                    implied_prob_up=implied_prob_up,
+                    remaining_seconds=remaining,
+                    order_book=order_book,
+                    min_edge_override=dynamic_min_edge,
+                )
 
-            # Run full evaluation pipeline with liquidity-aware z-score
-            signal: Optional[Signal] = self.model.evaluate(
-                current_price=tick.last_price,
-                implied_prob_up=implied_prob_up,
-                remaining_seconds=remaining,
-                order_book=order_book,
-                min_edge_override=dynamic_min_edge,
-            )
+                cycle_ms: float = (time.perf_counter() - cycle_start) * 1000
 
-            cycle_ms: float = (time.perf_counter() - cycle_start) * 1000
-
-            # Step 7: Execute if signal exists
-            if signal:
-                # Select the correct token based on predicted direction
-                if signal.direction == "UP":
-                    token_id: str = self.current_market.yes_token_id
-                else:
-                    token_id = self.current_market.no_token_id
-
-                if self.state.test_mode:
-                    # Test mode: log the signal without placing real orders.
-                    # This allows validating the model's output quality
-                    # before risking real capital.
-                    self.logger.info(
-                        f"[TEST MODE] Signal: {signal.direction} | "
-                        f"edge={signal.edge:.4f} | "
-                        f"kelly={signal.kelly_fraction:.3f} | "
-                        f"mc_ev={signal.mc_ev:.4f}"
-                    )
-                    self.state.total_trades += 1  # count for statistics
-                else:
-                    # Live mode: place the actual order
-                    # Use dashboard exposure override if set, else config default
-                    exposure: float = (
-                        self._exposure_override or self.config.max_exposure_pct
-                    )
-
-                    # Before compounding activates, cap sizing to starting_capital.
-                    # After activation, use full live balance for Kelly scaling.
-                    balance_cap: Optional[float] = None
-                    if not self.state.compounding_active:
-                        balance_cap = self.config.starting_capital
-
-                    # Record prediction for outcome resolution at window end
-                    self._pending_prediction = {
-                        "direction": signal.direction,
-                        "entry_price": tick.last_price,
-                    }
-
-                    # Determine order strategy: rebate-optimized batch vs standard.
-                    # rebate_optimizer checks CLOB dollar depth and returns optimal
-                    # pricing/batching config. Falls back to single order in thin books.
-                    rebate_cfg: dict = rebate_optimizer(
-                        order_book,
-                        midpoint=implied_prob_up,
-                        depth_threshold=self.config.rebate_depth_threshold,
-                        rebate_offset=self.config.rebate_price_offset,
-                    )
-
-                    # Low-vol batch override: if volatility is very low, force batch
-                    # even if depth doesn't meet rebate threshold
-                    use_low_vol_batch: bool = (
-                        self.model.volatility < self.config.low_vol_threshold
-                        and self.model.volatility > 0
-                        and not rebate_cfg["use_rebate_batch"]
-                    )
-
-                    if rebate_cfg["use_rebate_batch"]:
-                        # Rebate-optimized: 3 levels at tighter offset (0.005)
-                        results = await loop.run_in_executor(
-                            None,
-                            self.executor.place_rebate_optimized_orders,
-                            token_id,
-                            signal.direction,
-                            signal.kelly_fraction,
-                            implied_prob_up,
-                            rebate_cfg,
-                            exposure,
-                            balance_cap,
-                        )
-                    elif use_low_vol_batch:
-                        # Low-vol standard batch: 3 levels at standard offset (0.01)
-                        results = await loop.run_in_executor(
-                            None,
-                            self.executor.place_batch_maker_limits,
-                            token_id,
-                            signal.direction,
-                            signal.kelly_fraction,
-                            implied_prob_up,
-                            exposure,
-                            3,  # levels
-                            balance_cap,
-                        )
+                # Step 7: Execute if signal exists
+                if signal:
+                    # Select the correct token based on predicted direction
+                    if signal.direction == "UP":
+                        token_id: str = self.current_market.yes_token_id
                     else:
-                        # Standard single maker limit
-                        single_result: Optional[OrderResult] = await loop.run_in_executor(
-                            None,
-                            self.executor.place_maker_limit,
-                            token_id,
-                            signal.direction,
-                            signal.kelly_fraction,
-                            implied_prob_up,
-                            exposure,
-                            balance_cap,
-                        )
-                        results = [single_result] if single_result else []
+                        token_id = self.current_market.no_token_id
 
-                    for order_result in results:
+                    if self.state.test_mode:
+                        self.logger.info(
+                            f"[TEST MODE] Signal: {signal.direction} | "
+                            f"edge={signal.edge:.4f} | "
+                            f"kelly={signal.kelly_fraction:.3f} | "
+                            f"mc_ev={signal.mc_ev:.4f}"
+                        )
                         self.state.total_trades += 1
-                        self._update_rebate_tracker(order_result)
-                        self._update_compounding()
-                        self._push_event({
-                            "type": "trade",
-                            "timestamp": time.time(),
+                    else:
+                        # Live mode: place the actual order
+                        exposure: float = (
+                            self._exposure_override or self.config.max_exposure_pct
+                        )
+
+                        balance_cap: Optional[float] = None
+                        if not self.state.compounding_active:
+                            balance_cap = self.config.starting_capital
+
+                        self._pending_prediction = {
                             "direction": signal.direction,
-                            "edge": signal.edge,
-                            "z_score": signal.z_score,
-                            "model_prob": signal.true_prob,
-                            "implied_prob": signal.implied_prob,
-                            "kelly_fraction": signal.kelly_fraction,
-                            "fill_price": order_result.price,
-                            "size": order_result.size,
-                            "mc_ev": signal.mc_ev,
-                            "outcome": None,
-                            "gas_paid": self.config.gas_buffer_usdc,
-                            "net_pnl": None,
-                        })
+                            "entry_price": tick.last_price,
+                        }
+
+                        rebate_cfg: dict = rebate_optimizer(
+                            order_book,
+                            midpoint=implied_prob_up,
+                            depth_threshold=self.config.rebate_depth_threshold,
+                            rebate_offset=self.config.rebate_price_offset,
+                        )
+
+                        use_low_vol_batch: bool = (
+                            self.model.volatility < self.config.low_vol_threshold
+                            and self.model.volatility > 0
+                            and not rebate_cfg["use_rebate_batch"]
+                        )
+
+                        if rebate_cfg["use_rebate_batch"]:
+                            results = await loop.run_in_executor(
+                                None,
+                                self.executor.place_rebate_optimized_orders,
+                                token_id,
+                                signal.direction,
+                                signal.kelly_fraction,
+                                implied_prob_up,
+                                rebate_cfg,
+                                exposure,
+                                balance_cap,
+                            )
+                        elif use_low_vol_batch:
+                            results = await loop.run_in_executor(
+                                None,
+                                self.executor.place_batch_maker_limits,
+                                token_id,
+                                signal.direction,
+                                signal.kelly_fraction,
+                                implied_prob_up,
+                                exposure,
+                                3,
+                                balance_cap,
+                            )
+                        else:
+                            single_result: Optional[OrderResult] = await loop.run_in_executor(
+                                None,
+                                self.executor.place_maker_limit,
+                                token_id,
+                                signal.direction,
+                                signal.kelly_fraction,
+                                implied_prob_up,
+                                exposure,
+                                balance_cap,
+                            )
+                            results = [single_result] if single_result else []
+
+                        for order_result in results:
+                            self.state.total_trades += 1
+                            self._update_rebate_tracker(order_result)
+                            self._update_compounding()
+                            self._push_event({
+                                "type": "trade",
+                                "timestamp": time.time(),
+                                "direction": signal.direction,
+                                "edge": signal.edge,
+                                "z_score": signal.z_score,
+                                "model_prob": signal.true_prob,
+                                "implied_prob": signal.implied_prob,
+                                "kelly_fraction": signal.kelly_fraction,
+                                "fill_price": order_result.price,
+                                "size": order_result.size,
+                                "mc_ev": signal.mc_ev,
+                                "outcome": None,
+                                "gas_paid": self.config.gas_buffer_usdc,
+                                "net_pnl": None,
+                            })
 
             # Step 8: Latency monitor — record cycle, warn if >80ms, auto-tune poll
             self.latency_monitor.record(cycle_ms)
@@ -932,6 +1150,9 @@ class AsyncBot:
                 "is_paused": self.state.is_paused,
                 "compounding_active": self.state.compounding_active,
                 "cycle_ms": cycle_ms,
+                "mm_active": self.state.mm_active,
+                "mm_trades": self.state.mm_trades,
+                "mm_spread_profit": self.state.mm_spread_profit,
             })
 
     async def run(self) -> None:

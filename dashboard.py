@@ -242,6 +242,7 @@ def render_trade_table(trades: List[dict]) -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "Time",
+                "Mode",
                 "Direction",
                 "Edge",
                 "Z-Score",
@@ -250,6 +251,7 @@ def render_trade_table(trades: List[dict]) -> pd.DataFrame:
                 "Outcome",
                 "Gas",
                 "Net P&L",
+                "Spread P&L",
             ]
         )
 
@@ -260,6 +262,7 @@ def render_trade_table(trades: List[dict]) -> pd.DataFrame:
                 "Time": datetime.datetime.fromtimestamp(
                     t.get("timestamp", 0)
                 ).strftime("%H:%M:%S"),
+                "Mode": "MM" if t.get("direction") == "MM-SPREAD" else "DIR",
                 "Direction": t.get("direction", "—"),
                 "Edge": f"{t.get('edge', 0):.4f}",
                 "Z-Score": f"{t.get('z_score', 0):.2f}",
@@ -269,6 +272,11 @@ def render_trade_table(trades: List[dict]) -> pd.DataFrame:
                 "Gas": f"${t.get('gas_paid', 0):.3f}",
                 "Net P&L": (
                     f"${t['net_pnl']:.2f}" if t.get("net_pnl") is not None else "—"
+                ),
+                "Spread P&L": (
+                    f"${t['mm_spread']:.4f}"
+                    if t.get("mm_spread") is not None
+                    else "—"
                 ),
             }
         )
@@ -595,6 +603,29 @@ def main_page() -> None:
             f"Strategy Health: {health_label}</div>",
             unsafe_allow_html=True,
         )
+
+        # --- MM Mode Indicator ---
+        if state.latest_status and state.latest_status.get("mm_active"):
+            st.markdown(
+                '<div style="padding:6px 12px;border-radius:6px;background:#ff6b00;'
+                'color:white;text-align:center;font-weight:bold;margin-bottom:8px">'
+                'MM Mode Active &mdash; Spread Locked</div>',
+                unsafe_allow_html=True,
+            )
+
+        # --- MM Metrics ---
+        if state.latest_status and state.latest_status.get("mm_trades", 0) > 0:
+            mm_col1, mm_col2 = st.columns(2)
+            with mm_col1:
+                st.metric(
+                    "MM Trades",
+                    f"{state.latest_status.get('mm_trades', 0):,}",
+                )
+            with mm_col2:
+                st.metric(
+                    "MM Spread Profit",
+                    f"${state.latest_status.get('mm_spread_profit', 0):.4f}",
+                )
 
         # --- Row 2: Equity Curve ---
         st.subheader("Equity Curve")

@@ -15,7 +15,7 @@ Over hundreds of trades, this hidden edge compounds significantly.
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
@@ -590,3 +590,114 @@ class OrderExecutor:
             self.logger.info("All orders cancelled")
         except Exception as e:
             self.logger.error(f"cancel_all failed: {e}")
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a single order by ID.
+
+        Used by MM mode to cancel the losing side of a spread-locked
+        position while keeping the winning side active.
+
+        Args:
+            order_id: CLOB-assigned order identifier
+
+        Returns:
+            True if cancel succeeded, False on failure
+        """
+        try:
+            self.client.cancel(order_id)
+            for o in self.active_orders:
+                if o.order_id == order_id:
+                    o.status = "cancelled"
+            return True
+        except Exception as e:
+            self.logger.warning(f"Cancel order {order_id[:12]}... failed: {e}")
+            return False
+
+    def place_mm_pair(
+        self,
+        yes_token_id: str,
+        no_token_id: str,
+        yes_price: float,
+        no_price: float,
+        balance: float,
+        mm_exposure_pct: float = 0.05,
+    ) -> Tuple[Optional[OrderResult], Optional[OrderResult]]:
+        """Place simultaneous maker limit BUYs on both YES and NO tokens.
+
+        Market-making spread trade: buy both sides when YES_mid + NO_mid < 0.99
+        to lock in guaranteed payout minus costs. Each side is sized to
+        mm_exposure_pct of balance (5% each, 10% total exposure).
+
+        Args:
+            yes_token_id: YES outcome token ID
+            no_token_id: NO outcome token ID
+            yes_price: Limit price for YES buy (midpoint - 0.01)
+            no_price: Limit price for NO buy (midpoint - 0.01)
+            balance: Current USDC balance
+            mm_exposure_pct: Fraction of balance per side (default 5%)
+
+        Returns:
+            Tuple of (yes_order, no_order), either may be None on failure
+        """
+        # Reserve 2x gas (one per order)
+        available: float = balance - self.safety_floor - self.gas_buffer * 2
+        if available <= 0:
+            self.logger.warning(
+                f"MM pair: below safety floor: balance={balance:.2f}"
+            )
+            return (None, None)
+
+        dollar_per_side: float = available * mm_exposure_pct
+        dollar_per_side = min(dollar_per_side, available / 2)  # never exceed half
+
+        yes_size: float = round(dollar_per_side / yes_price, 2) if yes_price > 0 else 0
+        no_size: float = round(dollar_per_side / no_price, 2) if no_price > 0 else 0
+
+        if yes_size < 0.01 or no_size < 0.01:
+            self.logger.warning("MM pair: size too small after safety guards")
+            return (None, None)
+
+        yes_order: Optional[OrderResult] = None
+        no_order: Optional[OrderResult] = None
+
+        # Place YES side
+        try:
+            yes_args = OrderArgs(
+                token_id=yes_token_id, price=yes_price,
+                size=yes_size, side=BUY,
+            )
+            yes_signed = self.client.create_order(yes_args)
+            yes_resp = self.client.post_order(yes_signed, OrderType.GTC)
+            yes_order = OrderResult(
+                order_id=yes_resp.get("orderID", ""),
+                side=BUY, price=yes_price, size=yes_size,
+                token_id=yes_token_id, timestamp=time.time(), status="posted",
+            )
+            self.active_orders.append(yes_order)
+            self.logger.info(
+                f"MM YES order posted: {yes_size:.2f} @ {yes_price:.2f}"
+            )
+        except Exception as e:
+            self.logger.error(f"MM YES order failed: {e}")
+
+        # Place NO side
+        try:
+            no_args = OrderArgs(
+                token_id=no_token_id, price=no_price,
+                size=no_size, side=BUY,
+            )
+            no_signed = self.client.create_order(no_args)
+            no_resp = self.client.post_order(no_signed, OrderType.GTC)
+            no_order = OrderResult(
+                order_id=no_resp.get("orderID", ""),
+                side=BUY, price=no_price, size=no_size,
+                token_id=no_token_id, timestamp=time.time(), status="posted",
+            )
+            self.active_orders.append(no_order)
+            self.logger.info(
+                f"MM NO order posted: {no_size:.2f} @ {no_price:.2f}"
+            )
+        except Exception as e:
+            self.logger.error(f"MM NO order failed: {e}")
+
+        return (yes_order, no_order)

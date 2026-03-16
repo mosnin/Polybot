@@ -91,6 +91,16 @@ class Config:
     # time for maker fill + price movement to realize edge
     min_remaining_window_secs: int = 10
 
+    # --- Market-Making Mode ---
+    # When YES_mid + NO_mid < threshold, buy both sides to lock in spread profit.
+    # After cancel_delay seconds, drop the losing side and ride the winner.
+    mm_enabled: bool = True
+    mm_spread_threshold: float = 0.99     # trigger when yes_mid + no_mid < this
+    mm_exposure_pct: float = 0.05         # 5% of balance PER SIDE (10% total)
+    mm_cancel_delay_secs: float = 45.0    # seconds before cancelling losing side
+    mm_check_interval_secs: float = 3.0   # how often to check for MM opportunity
+    mm_min_remaining_secs: float = 90.0   # minimum window time left for MM entry
+
     # --- Monte Carlo Simulation ---
     # 1000 paths balances accuracy vs latency. Vectorized numpy keeps this <5ms.
     mc_paths: int = 1000
@@ -219,6 +229,12 @@ def load_config() -> Config:
                 f"got {addr}, expected {expected}"
             )
 
+    # Market-making overrides from .env
+    mm_enabled: bool = os.getenv("MM_ENABLED", "true").lower() == "true"
+    mm_spread_threshold: float = float(os.getenv("MM_SPREAD_THRESHOLD", "0.99"))
+    mm_exposure_pct: float = float(os.getenv("MM_EXPOSURE_PCT", "0.05"))
+    mm_cancel_delay_secs: float = float(os.getenv("MM_CANCEL_DELAY_SECS", "45.0"))
+
     return Config(
         private_key=private_key,
         alchemy_rpc_url=rpc_url,
@@ -228,4 +244,8 @@ def load_config() -> Config:
         smtp_user=smtp_user,
         smtp_pass=smtp_pass,
         alert_email=alert_email,
+        mm_enabled=mm_enabled,
+        mm_spread_threshold=mm_spread_threshold,
+        mm_exposure_pct=mm_exposure_pct,
+        mm_cancel_delay_secs=mm_cancel_delay_secs,
     )

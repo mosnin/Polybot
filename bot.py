@@ -665,7 +665,7 @@ async def main() -> None:
 
         dashboard_proc = multiprocessing.Process(
             target=run_dashboard,
-            args=(event_queue, control_queue, config.private_key),
+            args=(event_queue, control_queue, config.private_key, config.alchemy_rpc_url),
             daemon=True,  # auto-killed when main process exits
         )
         dashboard_proc.start()

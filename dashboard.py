@@ -35,6 +35,8 @@ import pandas as pd
 _EVENT_QUEUE: Optional[multiprocessing.Queue] = None
 _CONTROL_QUEUE: Optional[multiprocessing.Queue] = None
 _WALLET_ADDRESS: str = ""
+_PRIVATE_KEY: str = ""  # needed for approve/withdraw scripts
+_RPC_URL: str = ""  # needed for web3 calls in approve/withdraw
 
 # Refresh interval in seconds — balances CPU usage vs responsiveness
 REFRESH_INTERVAL: int = 5
@@ -408,27 +410,68 @@ def main_page() -> None:
 
         st.divider()
 
-        # Withdraw button
+        # Approve USDC for trading (one-time setup)
+        st.subheader("USDC Approval")
+        st.caption("One-time approval for Polymarket exchange contracts")
+        if st.button("Approve USDC for Trading", use_container_width=True):
+            if _PRIVATE_KEY and _RPC_URL:
+                with st.spinner("Broadcasting approval transaction..."):
+                    try:
+                        from approve_usdc import approve_from_dashboard
+
+                        result = approve_from_dashboard(_PRIVATE_KEY, _RPC_URL)
+                        if result["status"] == "success":
+                            tx_display: str = result.get("ctf_tx", "")[:16]
+                            st.success(f"Approved! TX: {tx_display}...")
+                        elif result["status"] == "already_approved":
+                            st.info("Already approved — no action needed")
+                        else:
+                            st.error(f"Failed: {result.get('error', 'unknown')}")
+                    except Exception as e:
+                        st.error(f"Approval error: {e}")
+            else:
+                st.warning("Wallet not configured")
+
+        st.divider()
+
+        # Withdraw with live balance as max withdrawable amount
         st.subheader("Withdraw")
+        max_withdraw: float = max(state.balance - 1.0, 0.0)  # keep $1 buffer
+        st.caption(f"Max withdrawable: ${max_withdraw:.2f}")
         withdraw_amount: float = st.number_input(
             "Amount (USDC)",
             min_value=0.0,
-            max_value=10000.0,
+            max_value=max(max_withdraw, 0.01),  # prevent max_value=0 error
             value=0.0,
             step=10.0,
             key="withdraw_input",
         )
-        if st.button("Request Withdraw", use_container_width=True):
-            if withdraw_amount > 0 and _CONTROL_QUEUE is not None:
-                try:
-                    _CONTROL_QUEUE.put_nowait(
-                        {"type": "withdraw", "amount": withdraw_amount}
-                    )
-                except Exception:
-                    pass
-                st.success(f"Withdraw request sent: ${withdraw_amount:.2f}")
+        if st.button("Execute Withdraw", use_container_width=True):
+            if withdraw_amount > 0 and _PRIVATE_KEY and _RPC_URL:
+                with st.spinner("Processing withdrawal..."):
+                    try:
+                        import asyncio as _asyncio
+
+                        from withdraw import withdraw_from_dashboard
+
+                        result = _asyncio.run(
+                            withdraw_from_dashboard(
+                                _PRIVATE_KEY, _RPC_URL, withdraw_amount
+                            )
+                        )
+                        if result["status"] == "success":
+                            st.success(
+                                f"Withdraw complete: ${withdraw_amount:.2f} USDC\n"
+                                f"TX: {result.get('tx_hash', 'N/A')[:20]}..."
+                            )
+                        else:
+                            st.error(f"Failed: {result.get('error', 'unknown')}")
+                    except Exception as e:
+                        st.error(f"Withdraw error: {e}")
             elif withdraw_amount <= 0:
                 st.warning("Enter an amount > 0")
+            else:
+                st.warning("Wallet not configured")
 
         st.divider()
 
@@ -453,6 +496,7 @@ def run_dashboard(
     event_queue: multiprocessing.Queue,
     control_queue: multiprocessing.Queue,
     private_key: str,
+    rpc_url: str = "",
 ) -> None:
     """Entry point for the dashboard process.
 
@@ -463,14 +507,17 @@ def run_dashboard(
     Args:
         event_queue: Queue for receiving bot events
         control_queue: Queue for sending control commands to bot
-        private_key: Polygon private key for deriving wallet address
+        private_key: Polygon private key for approve/withdraw scripts
+        rpc_url: Alchemy RPC URL for web3 calls in approve/withdraw
     """
-    global _EVENT_QUEUE, _CONTROL_QUEUE, _WALLET_ADDRESS
+    global _EVENT_QUEUE, _CONTROL_QUEUE, _WALLET_ADDRESS, _PRIVATE_KEY, _RPC_URL
 
     _EVENT_QUEUE = event_queue
     _CONTROL_QUEUE = control_queue
+    _PRIVATE_KEY = private_key
+    _RPC_URL = rpc_url
 
-    # Derive wallet address from private key (don't store the key itself)
+    # Derive wallet address from private key
     try:
         from eth_account import Account
 

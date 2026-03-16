@@ -95,6 +95,27 @@ class Config:
     # Target computation budget for full model.evaluate() call
     mc_target_ms: int = 30
 
+    # --- Polygon Contract Addresses ---
+    # USDC.e (bridged) on Polygon — primary collateral for all Polymarket trading.
+    # 6 decimals: 1 USDC = 1_000_000 wei units.
+    usdc_token_address: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    usdc_decimals: int = 6
+
+    # Polymarket CTF Exchange — needs USDC approval for standard market order matching.
+    # This is the main exchange contract that escrows collateral when placing orders.
+    ctf_exchange_address: str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+
+    # Neg Risk CTF Exchange — needs USDC approval for multi-outcome / neg-risk markets.
+    # BTC 5-min markets may use either exchange depending on market structure.
+    neg_risk_ctf_exchange_address: str = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+
+    # Conditional Tokens (ERC1155) — Polymarket's token framework contract.
+    # Handles split, merge, and redeem operations for conditional outcome tokens.
+    conditional_tokens_address: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+    # Bridge API base URL for withdrawal operations
+    bridge_api_base: str = "https://clob.polymarket.com"
+
 
 def load_config() -> Config:
     """Factory function that reads .env and returns a validated Config.

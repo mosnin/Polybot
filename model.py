@@ -237,7 +237,7 @@ class BayesianModel:
 
     @property
     def volatility(self) -> float:
-        """Per-tick volatility as standard deviation of log returns.
+        """Per-tick volatility as standard deviation of simple returns.
 
         Computed over the last 30 ticks (VOLATILITY_WINDOW). This captures
         the current regime's noise level — high volatility means larger

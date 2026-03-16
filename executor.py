@@ -186,10 +186,16 @@ class OrderExecutor:
         # Kelly-sized dollar risk
         dollar_risk: float = available * kelly_fraction
 
-        # Hard clamp to 5%-max_exposure_pct of total balance regardless of Kelly output
-        min_risk: float = balance * 0.05
+        # Hard clamp to max_exposure_pct of total balance regardless of Kelly output.
+        # Only enforce the 5% floor when Kelly signals meaningful conviction
+        # (fraction >= 0.01). Otherwise, respect Kelly's low sizing on weak signals
+        # to avoid oversizing trades where the model has low confidence.
         max_risk: float = balance * max_exposure_pct
-        dollar_risk = max(min(dollar_risk, max_risk), min_risk)
+        if kelly_fraction >= 0.01:
+            min_risk: float = balance * 0.05
+            dollar_risk = max(min(dollar_risk, max_risk), min_risk)
+        else:
+            dollar_risk = min(dollar_risk, max_risk)
 
         # Never exceed available capital
         dollar_risk = min(dollar_risk, available)

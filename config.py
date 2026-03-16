@@ -66,7 +66,7 @@ class Config:
     round_trip_cost_pct: float = 0.003  # 0.3%
 
     # Never let balance drop below this floor. Preserves capital for recovery.
-    safety_floor_usdc: float = 100.0
+    safety_floor_usdc: float = 10.0
 
     # Hard stop: if drawdown from peak exceeds this, halt all trading.
     # Protects against regime changes or model breakdown.

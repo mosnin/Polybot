@@ -138,6 +138,10 @@ class AsyncBot:
         # Cycle latency tracking for performance monitoring
         self.cycle_times: Deque[float] = deque(maxlen=100)
 
+        # Track last trade's prediction for win/loss outcome resolution.
+        # Set when an order is placed; resolved when the window ends (new window arrives).
+        self._pending_prediction: Optional[dict] = None  # {"direction": str, "entry_price": float}
+
     # --- Safety Controls ---
 
     def _check_drawdown(self) -> bool:
@@ -415,6 +419,30 @@ class AsyncBot:
         """
         while True:
             market: MarketWindow = await self.market_queue.get()
+
+            # Resolve the previous window's prediction outcome if we traded it.
+            # Compare exit price (last known price at window end) to entry price.
+            if self._pending_prediction is not None and self.last_price is not None:
+                pred = self._pending_prediction
+                price_went_up: bool = self.last_price > pred["entry_price"]
+                if pred["direction"] == "UP":
+                    won: bool = price_went_up
+                else:
+                    won = not price_went_up
+
+                if won:
+                    self.state.wins += 1
+                    self.state.consecutive_losses = 0
+                    self.logger.info("Previous window outcome: WIN")
+                else:
+                    self.state.losses += 1
+                    self.state.consecutive_losses += 1
+                    self.logger.info(
+                        f"Previous window outcome: LOSS "
+                        f"(streak={self.state.consecutive_losses})"
+                    )
+                self._pending_prediction = None
+
             self.current_market = market
             self.model.reset()
             self.last_price = None
@@ -485,10 +513,16 @@ class AsyncBot:
                 continue
 
             # Step 4: Safety checks
-            # Fetch balance via thread executor (sync HTTP call)
-            self.state.current_balance = await loop.run_in_executor(
-                None, self.executor.get_current_balance
-            )
+            # Fetch balance via thread executor (sync HTTP call).
+            # Fall back to last known balance on RPC failure to avoid crashing.
+            try:
+                self.state.current_balance = await loop.run_in_executor(
+                    None, self.executor.get_current_balance
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Balance fetch failed, using last known: {e}"
+                )
             self.state.peak_balance = max(
                 self.state.peak_balance, self.state.current_balance
             )
@@ -593,6 +627,12 @@ class AsyncBot:
                         self.model.volatility < self.config.low_vol_threshold
                         and self.model.volatility > 0
                     )
+
+                    # Record prediction for outcome resolution at window end
+                    self._pending_prediction = {
+                        "direction": signal.direction,
+                        "entry_price": tick.last_price,
+                    }
 
                     if use_batch:
                         results = await loop.run_in_executor(

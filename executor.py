@@ -208,6 +208,7 @@ class OrderExecutor:
         kelly_fraction: float,
         midpoint: float,
         max_exposure_pct: float = 0.10,
+        balance_cap: Optional[float] = None,
     ) -> Optional[OrderResult]:
         """Place a maker limit order targeting passive fills and rebates.
 
@@ -233,11 +234,14 @@ class OrderExecutor:
             kelly_fraction: Position size fraction from model
             midpoint: Current CLOB midpoint price
             max_exposure_pct: Maximum exposure cap, adjustable via dashboard
+            balance_cap: If set, cap effective balance for sizing (pre-compounding)
 
         Returns:
             OrderResult if successfully posted, None on failure
         """
         balance: float = self.get_current_balance()
+        if balance_cap is not None:
+            balance = min(balance, balance_cap)
 
         # Price one tick below midpoint → sits on the passive (maker) side.
         # This means we might not get filled immediately, but when we do,
@@ -294,6 +298,103 @@ class OrderExecutor:
         except Exception as e:
             self.logger.error(f"Order placement failed: {e}")
             return None
+
+    def place_batch_maker_limits(
+        self,
+        token_id: str,
+        direction: str,
+        kelly_fraction: float,
+        midpoint: float,
+        max_exposure_pct: float = 0.10,
+        levels: int = 3,
+        balance_cap: Optional[float] = None,
+    ) -> list:
+        """Place multiple maker limit orders at different price levels.
+
+        During low-volatility regimes, a single order at midpoint-0.01 may
+        not fill because the book is tight and there's little taker flow.
+        Spreading the position across multiple price levels:
+        - Increases overall fill probability
+        - Captures maker rebates on each level
+        - Reduces per-order gas cost relative to total filled volume
+
+        The total position size is the same as a single order — it's just
+        distributed across levels. Each level gets an equal share.
+
+        Price levels:
+        - Level 0: midpoint - 0.01 (best fill probability, worst price)
+        - Level 1: midpoint - 0.02 (moderate fill, better price)
+        - Level 2: midpoint - 0.03 (lowest fill, best price for us)
+
+        Args:
+            token_id: Which conditional token to buy
+            direction: "UP" or "DOWN" (for logging)
+            kelly_fraction: Position size fraction from model
+            midpoint: Current CLOB midpoint price
+            max_exposure_pct: Maximum exposure cap
+            levels: Number of price levels to spread across (default 3)
+            balance_cap: If set, cap effective balance for sizing
+
+        Returns:
+            List of OrderResult for successfully posted orders
+        """
+        balance: float = self.get_current_balance()
+        if balance_cap is not None:
+            balance = min(balance, balance_cap)
+
+        # Compute total size at the best price level, then split
+        best_price: float = round(midpoint - 0.01, 2)
+        if best_price <= 0.0 or best_price >= 1.0:
+            best_price = round(midpoint, 2)
+            best_price = max(0.01, min(best_price, 0.99))
+
+        total_size: Optional[float] = self._compute_order_size(
+            balance, kelly_fraction, best_price, max_exposure_pct
+        )
+        if total_size is None:
+            self.logger.warning(
+                f"Batch order skipped: insufficient balance for {direction}"
+            )
+            return []
+
+        per_level_size: float = round(total_size / levels, 2)
+        if per_level_size < 0.01:
+            return []
+
+        results: list = []
+        for i in range(levels):
+            price: float = round(midpoint - 0.01 * (i + 1), 2)
+            if price <= 0.0 or price >= 1.0:
+                continue
+
+            try:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=per_level_size,
+                    side=BUY,
+                )
+                signed_order = self.client.create_order(order_args)
+                response = self.client.post_order(signed_order, OrderType.GTC)
+
+                result = OrderResult(
+                    order_id=response.get("orderID", response.get("id", "unknown")),
+                    side=BUY,
+                    price=price,
+                    size=per_level_size,
+                    token_id=token_id,
+                    timestamp=time.time(),
+                    status="posted",
+                )
+                self.active_orders.append(result)
+                results.append(result)
+                self.logger.info(
+                    f"Batch order L{i}: {direction} {per_level_size:.2f} @ {price:.2f}"
+                )
+            except Exception as e:
+                self.logger.error(f"Batch order L{i} failed: {e}")
+
+        return results
 
     def cancel_stale_orders(self, max_age_seconds: float = 10.0) -> None:
         """Cancel orders older than max_age_seconds.

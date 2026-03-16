@@ -81,6 +81,11 @@ class BayesianModel:
     VOLATILITY_WINDOW: int = 30  # number of ticks for rolling volatility
     MC_PATHS: int = 1000  # Monte Carlo simulation paths
 
+    # Liquidity depth thresholds for dynamic z-score scaling.
+    # Total token depth across top 3 bid + ask levels in the CLOB.
+    THIN_BOOK_DEPTH: float = 500.0   # below this → high noise → raise bar
+    THICK_BOOK_DEPTH: float = 5000.0  # above this → low noise → lower bar
+
     def __init__(
         self,
         min_edge: float = 0.02,
@@ -252,22 +257,83 @@ class BayesianModel:
         returns: np.ndarray = np.diff(prices) / prices[:-1]
         return float(np.std(returns))
 
-    def _compute_z_score(self, true_prob: float, implied_prob: float) -> float:
-        """Normalize the edge by volatility to get a confidence-weighted score.
+    def _compute_liquidity_factor(self, order_book: Optional[dict]) -> float:
+        """Compute a z-score scaling factor from CLOB order book depth.
 
-        z_score = (true_prob - implied_prob) / volatility
+        Thin order books indicate low liquidity and higher noise — signals
+        in thin markets are less reliable because small orders can move the
+        midpoint. We scale the z-score down (divide by factor > 1) to raise
+        the bar for trade entry when liquidity is thin.
+
+        Thick books indicate a well-stocked market where the midpoint is
+        stable and our edge is more likely to be real, so we lower the bar.
+
+        The factor linearly interpolates between:
+        - THIN_BOOK_DEPTH (500 tokens)  → factor 1.5 (50% harder to trade)
+        - THICK_BOOK_DEPTH (5000 tokens) → factor 0.8 (20% easier to trade)
+
+        Args:
+            order_book: Dict with 'bids' and 'asks' arrays from CLOB,
+                        or None if unavailable (graceful degradation)
+
+        Returns:
+            Scaling factor >= 0.8 — multiply into z_score denominator
+        """
+        if order_book is None:
+            return 1.0
+
+        try:
+            bids = order_book.get("bids", [])
+            asks = order_book.get("asks", [])
+
+            # Sum sizes from top 3 levels on each side
+            bid_depth: float = sum(
+                float(level.get("size", level[1]) if isinstance(level, dict) else level[1])
+                for level in bids[:3]
+            )
+            ask_depth: float = sum(
+                float(level.get("size", level[1]) if isinstance(level, dict) else level[1])
+                for level in asks[:3]
+            )
+            total_depth: float = bid_depth + ask_depth
+
+            # Linear interpolation between thin and thick thresholds
+            if total_depth <= self.THIN_BOOK_DEPTH:
+                return 1.5
+            if total_depth >= self.THICK_BOOK_DEPTH:
+                return 0.8
+            # Interpolate: 1.5 at thin, 0.8 at thick
+            t: float = (total_depth - self.THIN_BOOK_DEPTH) / (
+                self.THICK_BOOK_DEPTH - self.THIN_BOOK_DEPTH
+            )
+            return 1.5 - t * 0.7  # 1.5 → 0.8
+
+        except Exception:
+            return 1.0  # degrade gracefully on parse errors
+
+    def _compute_z_score(
+        self,
+        true_prob: float,
+        implied_prob: float,
+        liquidity_factor: float = 1.0,
+    ) -> float:
+        """Normalize the edge by volatility and liquidity to get a confidence score.
+
+        z_score = (true_prob - implied_prob) / (volatility * liquidity_factor)
+
+        The liquidity_factor adjusts for order book depth:
+        - Thin books (factor > 1.0) → lower z_score → harder to pass thresholds
+        - Thick books (factor < 1.0) → higher z_score → edge more reliable
 
         Interpretation:
         - |z| > 2: strong signal, edge is 2+ standard deviations from noise
         - |z| 1-2: moderate signal, proceed with caution
         - |z| < 1: weak signal, likely noise — don't trade
 
-        The min_edge threshold in evaluate() handles the gating, but z_score
-        is logged for analysis and model tuning.
-
         Args:
             true_prob: Our Bayesian estimate of P(correct direction)
             implied_prob: Market's estimate from CLOB midpoint
+            liquidity_factor: Scaling factor from order book depth (default 1.0)
 
         Returns:
             z-score float, or 0.0 if volatility is negligible
@@ -276,7 +342,7 @@ class BayesianModel:
         if vol < 1e-10:
             # Near-zero volatility means price hasn't moved — no signal
             return 0.0
-        return (true_prob - implied_prob) / vol
+        return (true_prob - implied_prob) / (vol * liquidity_factor)
 
     def _monte_carlo(
         self, current_price: float, remaining_seconds: float, direction: str
@@ -372,6 +438,7 @@ class BayesianModel:
         current_price: float,
         implied_prob_up: float,
         remaining_seconds: float,
+        order_book: Optional[dict] = None,
     ) -> Optional[Signal]:
         """Full evaluation pipeline: Bayesian posterior → z-score → MC → Kelly.
 
@@ -381,20 +448,22 @@ class BayesianModel:
         2. Determine direction: UP if posterior > 0.5, DOWN otherwise
         3. Compute net edge = |true_prob - implied_prob| - round_trip_cost
         4. If net edge < min_edge_threshold → return None (not worth trading)
-        5. Run Monte Carlo to validate edge over 1000 simulated paths
-        6. If MC expected value ≤ 0 → return None (edge doesn't survive noise)
-        7. Compute Kelly fraction for position sizing
-        8. Return Signal with all metrics
+        5. Compute liquidity-adjusted z-score from order book depth
+        6. Run Monte Carlo to validate edge over 1000 simulated paths
+        7. If MC expected value ≤ 0 → return None (edge doesn't survive noise)
+        8. Compute Kelly fraction for position sizing
+        9. Return Signal with all metrics
 
-        The dual gating (edge threshold + MC EV) is the key to avoiding
-        false signals. The Bayesian posterior can overfit to short-term
-        noise; the MC simulation stress-tests whether the edge persists
-        across random future paths.
+        The triple gating (edge threshold + liquidity-adjusted z-score + MC EV)
+        is the key to avoiding false signals. The Bayesian posterior can overfit
+        to short-term noise; the z-score adjusts for market depth; the MC
+        simulation stress-tests whether the edge persists across random paths.
 
         Args:
             current_price: Latest BTC price from Binance
             implied_prob_up: CLOB midpoint price of the UP token (= market P(up))
             remaining_seconds: Seconds until this 5-min window resolves
+            order_book: Optional CLOB L2 order book for liquidity-aware z-score
 
         Returns:
             Signal if profitable edge found, None otherwise
@@ -423,8 +492,13 @@ class BayesianModel:
         if edge < self.min_edge:
             return None
 
-        # Z-score for confidence weighting
-        z_score: float = self._compute_z_score(directional_true, directional_implied)
+        # Z-score with dynamic liquidity adjustment
+        # Thin order books → factor > 1 → lower z_score → harder to trade
+        # Thick order books → factor < 1 → higher z_score → edge more reliable
+        liquidity_factor: float = self._compute_liquidity_factor(order_book)
+        z_score: float = self._compute_z_score(
+            directional_true, directional_implied, liquidity_factor
+        )
 
         # Gate 2: Monte Carlo validation
         # Even if the instantaneous edge looks good, simulate 1000 paths

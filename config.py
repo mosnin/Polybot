@@ -95,6 +95,12 @@ class Config:
     # Target computation budget for full model.evaluate() call
     mc_target_ms: int = 30
 
+    # Per-tick volatility below which batch orders are used instead of single.
+    # 0.0005 = std(returns) < 5 bps per tick — very calm market where a single
+    # maker order at midpoint-0.01 may not fill. Spreading across multiple levels
+    # increases fill probability and captures rebates on each.
+    low_vol_threshold: float = 0.0005
+
     # --- Polygon Contract Addresses ---
     # USDC.e (bridged) on Polygon — primary collateral for all Polymarket trading.
     # 6 decimals: 1 USDC = 1_000_000 wei units.

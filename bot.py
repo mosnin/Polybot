@@ -26,6 +26,7 @@ Usage:
 """
 
 import asyncio
+import datetime
 import logging
 import multiprocessing
 import os
@@ -33,7 +34,7 @@ import queue as queue_mod  # for queue.Empty exception
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Optional
+from typing import Deque, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -63,6 +64,9 @@ class BotState:
     is_paused: bool = False
     compounding_active: bool = False
     test_mode: bool = False
+    # Balance history for daily return calculation (compounding gate).
+    # Stores (unix_timestamp, balance) tuples. Capped at 50k entries (~14 hours).
+    equity_history: List[Tuple[float, float]] = field(default_factory=list)
 
 
 class AsyncBot:
@@ -182,16 +186,57 @@ class AsyncBot:
             return True
         return False
 
+    def _compute_avg_daily_return(self) -> float:
+        """Compute average daily net return from equity history.
+
+        Groups balance snapshots by calendar day and computes the
+        return for each complete day. Returns the average.
+
+        Used as a compounding gate: only activate compounding when
+        the bot demonstrates consistent daily profitability (>1%).
+
+        Returns:
+            Average daily return as a fraction (0.01 = 1%), or 0.0
+            if insufficient data (< 1 complete day).
+        """
+        history: List[Tuple[float, float]] = self.state.equity_history
+        if len(history) < 2:
+            return 0.0
+
+        # Group by calendar day
+        daily_balances: dict = {}
+        for ts, balance in history:
+            day: datetime.date = datetime.date.fromtimestamp(ts)
+            if day not in daily_balances:
+                daily_balances[day] = {"first": balance, "last": balance}
+            else:
+                daily_balances[day]["last"] = balance
+
+        # Compute daily returns for complete days (exclude today — incomplete)
+        today: datetime.date = datetime.date.today()
+        daily_returns: list = []
+        for day, bal in daily_balances.items():
+            if day == today:
+                continue  # incomplete day
+            if bal["first"] > 0:
+                daily_return: float = (bal["last"] - bal["first"]) / bal["first"]
+                daily_returns.append(daily_return)
+
+        if not daily_returns:
+            return 0.0
+        return sum(daily_returns) / len(daily_returns)
+
     def _update_compounding(self) -> None:
         """Activate compounding after sufficient statistical evidence.
 
-        Compounding means position sizes scale with balance growth.
-        Before activation (first 200 trades), sizes are based on
-        starting_capital to limit exposure while the edge is unproven.
+        Triple gate — all conditions must be met:
+        1. At least 200 trades (statistical significance)
+        2. Win rate > 50% (edge is real)
+        3. Average daily return > 1% (profitability confirmed)
 
-        After 200 trades with >50% win rate, compounding activates:
-        position sizes then scale with actual balance, letting profits
-        accelerate growth via the Kelly criterion.
+        Before activation, position sizes are capped to starting_capital
+        to limit exposure while the edge is unproven. After activation,
+        sizes scale dynamically with the full live balance via Kelly.
 
         Why 200 trades? At 60% true win rate:
         - 95% CI for observed win rate is [53%, 67%]
@@ -202,11 +247,12 @@ class AsyncBot:
             and not self.state.compounding_active
         ):
             win_rate: float = self.state.wins / max(self.state.total_trades, 1)
-            if win_rate > 0.5:
+            avg_daily: float = self._compute_avg_daily_return()
+            if win_rate > 0.5 and avg_daily > 0.01:
                 self.state.compounding_active = True
                 self.logger.info(
                     f"COMPOUNDING ACTIVATED: {self.state.total_trades} trades, "
-                    f"{win_rate:.1%} win rate"
+                    f"{win_rate:.1%} win rate, {avg_daily:.2%} avg daily return"
                 )
 
     # --- Daily Rebate Tracker ---
@@ -447,6 +493,13 @@ class AsyncBot:
                 self.state.peak_balance, self.state.current_balance
             )
 
+            # Track balance for daily return calculation (compounding gate)
+            self.state.equity_history.append(
+                (time.time(), self.state.current_balance)
+            )
+            if len(self.state.equity_history) > 50000:
+                self.state.equity_history = self.state.equity_history[-50000:]
+
             # Push live balance to dashboard
             self._push_event({
                 "type": "balance",
@@ -469,24 +522,35 @@ class AsyncBot:
             if self._check_streak():
                 continue
 
-            # Step 5: Get implied probability from CLOB midpoint
-            # For the UP token: midpoint = market's P(BTC goes up)
+            # Step 5: Get implied probability + order book in parallel
+            # Parallelizing these two HTTP calls via asyncio.gather keeps
+            # total I/O at max(midpoint_ms, orderbook_ms) instead of the sum,
+            # preserving the <80ms cycle target.
             try:
-                implied_prob_up: float = await loop.run_in_executor(
-                    None,
-                    self.executor.get_midpoint,
-                    self.current_market.yes_token_id,
+                token_id_for_fetch: str = self.current_market.yes_token_id
+                midpoint_result, order_book = await asyncio.gather(
+                    loop.run_in_executor(
+                        None,
+                        self.executor.get_midpoint,
+                        token_id_for_fetch,
+                    ),
+                    loop.run_in_executor(
+                        None,
+                        self.executor.get_order_book,
+                        token_id_for_fetch,
+                    ),
                 )
-                implied_prob_up = float(implied_prob_up)
+                implied_prob_up: float = float(midpoint_result)
             except Exception as e:
-                self.logger.error(f"Midpoint fetch failed: {e}")
+                self.logger.error(f"Midpoint/orderbook fetch failed: {e}")
                 continue
 
-            # Step 6: Run full evaluation pipeline
+            # Step 6: Run full evaluation pipeline with liquidity-aware z-score
             signal: Optional[Signal] = self.model.evaluate(
                 current_price=tick.last_price,
                 implied_prob_up=implied_prob_up,
                 remaining_seconds=remaining,
+                order_book=order_book,
             )
 
             cycle_ms: float = (time.perf_counter() - cycle_start) * 1000
@@ -516,16 +580,65 @@ class AsyncBot:
                     exposure: float = (
                         self._exposure_override or self.config.max_exposure_pct
                     )
-                    result: Optional[OrderResult] = await loop.run_in_executor(
-                        None,
-                        self.executor.place_maker_limit,
-                        token_id,
-                        signal.direction,
-                        signal.kelly_fraction,
-                        implied_prob_up,
-                        exposure,
+
+                    # Before compounding activates, cap sizing to starting_capital.
+                    # After activation, use full live balance for Kelly scaling.
+                    balance_cap: Optional[float] = None
+                    if not self.state.compounding_active:
+                        balance_cap = self.config.starting_capital
+
+                    # Low volatility → batch orders at multiple price levels
+                    # Normal volatility → single maker limit order
+                    use_batch: bool = (
+                        self.model.volatility < self.config.low_vol_threshold
+                        and self.model.volatility > 0
                     )
-                    if result:
+
+                    if use_batch:
+                        results = await loop.run_in_executor(
+                            None,
+                            self.executor.place_batch_maker_limits,
+                            token_id,
+                            signal.direction,
+                            signal.kelly_fraction,
+                            implied_prob_up,
+                            exposure,
+                            3,  # levels
+                            balance_cap,
+                        )
+                        for batch_result in results:
+                            self.state.total_trades += 1
+                            self._update_rebate_tracker(batch_result)
+                            self._update_compounding()
+                            self._push_event({
+                                "type": "trade",
+                                "timestamp": time.time(),
+                                "direction": signal.direction,
+                                "edge": signal.edge,
+                                "z_score": signal.z_score,
+                                "model_prob": signal.true_prob,
+                                "implied_prob": signal.implied_prob,
+                                "kelly_fraction": signal.kelly_fraction,
+                                "fill_price": batch_result.price,
+                                "size": batch_result.size,
+                                "mc_ev": signal.mc_ev,
+                                "outcome": None,
+                                "gas_paid": self.config.gas_buffer_usdc,
+                                "net_pnl": None,
+                            })
+                    else:
+                        result: Optional[OrderResult] = await loop.run_in_executor(
+                            None,
+                            self.executor.place_maker_limit,
+                            token_id,
+                            signal.direction,
+                            signal.kelly_fraction,
+                            implied_prob_up,
+                            exposure,
+                            balance_cap,
+                        )
+
+                    if not use_batch and result:
                         self.state.total_trades += 1
                         self._update_rebate_tracker(result)
                         self._update_compounding()

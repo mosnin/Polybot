@@ -306,7 +306,7 @@ class GammaMarketFinder:
                     self._token_cache[slug] = window
                     return window
 
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, json.JSONDecodeError, KeyError, ValueError) as e:
                 delay: float = 2.0**attempt
                 self.logger.warning(
                     f"Gamma fetch attempt {attempt + 1}/{retries} "

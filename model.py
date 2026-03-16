@@ -710,6 +710,9 @@ class BayesianModel:
             Dict with reservation_price, optimal_bid, optimal_ask,
             optimal_spread, sigma, gamma, remaining_secs, inventory_skew.
         """
+        # Guard against negative remaining time from timing races
+        remaining_secs = max(0.0, remaining_secs)
+
         sigma: float = self.volatility  # std of last 30 ticks
 
         # Inventory skew: center posterior around 0 (-0.5 to +0.5)

@@ -1200,6 +1200,9 @@ class AsyncBot:
                                 "net_pnl": None,
                             })
 
+                        # Reset MM miss counter — directional trade fired as tie-breaker
+                        self._mm_no_opportunity_count = 0
+
             # Step 8: Latency monitor — record cycle, warn if >80ms, auto-tune poll
             self.latency_monitor.record(cycle_ms)
             self.latency_monitor.auto_adjust_poll_interval(self.model.volatility)
@@ -1243,6 +1246,7 @@ class AsyncBot:
                 "mm_spread_profit": self.state.mm_spread_profit,
                 "orderflow_imbalance": self._orderflow_imbalance,
                 "explosive_mode": self.config.mm_spread_threshold < 0.99,
+                "starting_capital": self.config.starting_capital,
                 "stoikov_r": self._stoikov_state.get("reservation_price") if self._stoikov_state else None,
                 "stoikov_sigma": self._stoikov_state.get("sigma") if self._stoikov_state else None,
                 "stoikov_gamma": self.config.stoikov_gamma,

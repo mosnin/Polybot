@@ -544,9 +544,10 @@ class OrderExecutor:
                     f"Cancel failed for {order.order_id}: {e}"
                 )
 
-        # Purge completed/cancelled orders from active list
+        # Purge completed/cancelled orders and stale entries (>10 min old)
         self.active_orders = [
-            o for o in self.active_orders if o.status == "posted"
+            o for o in self.active_orders
+            if o.status == "posted" and (now - o.timestamp) < 600
         ]
 
     def cancel_all(self) -> None:

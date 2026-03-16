@@ -673,7 +673,7 @@ def main_page() -> None:
             total_trades = state.latest_status.get("total_trades", 0)
             mm_profit = state.latest_status.get("mm_spread_profit", 0)
             balance = state.latest_status.get("current_balance", 0)
-            starting = 100.0
+            starting = state.latest_status.get("starting_capital", 100.0)
 
             if total_trades > 0 and balance > 0:
                 net_return = (balance - starting + mm_profit) / starting

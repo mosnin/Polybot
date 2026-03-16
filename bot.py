@@ -27,7 +27,9 @@ Usage:
 
 import asyncio
 import logging
+import multiprocessing
 import os
+import queue as queue_mod  # for queue.Empty exception
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -75,16 +77,31 @@ class AsyncBot:
     hundreds of trades per day, they produce measurable profit.
     """
 
-    def __init__(self, config: Config, test_mode: bool = False) -> None:
+    def __init__(
+        self,
+        config: Config,
+        test_mode: bool = False,
+        event_queue: Optional[multiprocessing.Queue] = None,
+        control_queue: Optional[multiprocessing.Queue] = None,
+    ) -> None:
         """Initialize all components with shared communication queues.
 
         Args:
             config: Frozen Config dataclass with all parameters
             test_mode: If True, log signals but don't place real orders
+            event_queue: multiprocessing.Queue for pushing events to dashboard
+            control_queue: multiprocessing.Queue for receiving dashboard commands
         """
         self.config: Config = config
         self.console: Console = Console()
         self.logger: logging.Logger = logging.getLogger("Bot")
+
+        # Dashboard inter-process queues (None if dashboard disabled)
+        self.event_queue: Optional[multiprocessing.Queue] = event_queue
+        self.control_queue: Optional[multiprocessing.Queue] = control_queue
+
+        # Dashboard-adjustable exposure override (None = use config default)
+        self._exposure_override: Optional[float] = None
 
         # Shared asyncio queues — the glue between producer and consumer tasks.
         # maxsize prevents unbounded memory growth if consumers fall behind.
@@ -205,6 +222,56 @@ class AsyncBot:
         """
         volume: float = order.size * order.price
         self.state.daily_maker_volume += volume
+
+    # --- Dashboard Communication ---
+
+    def _push_event(self, event: dict) -> None:
+        """Non-blocking push to the dashboard event queue.
+
+        Uses put_nowait to never block the trading loop. If the queue
+        is full or the dashboard process has died, events are silently
+        dropped — the bot's performance is always the priority.
+        """
+        if self.event_queue is not None:
+            try:
+                self.event_queue.put_nowait(event)
+            except Exception:
+                pass  # never block the bot for dashboard updates
+
+    def _poll_controls(self) -> None:
+        """Non-blocking poll for dashboard control commands.
+
+        Checks the control queue for pause/resume, exposure adjustment,
+        and withdraw requests. Processes all available commands in a
+        single pass (drains the queue).
+        """
+        if self.control_queue is None:
+            return
+        while True:
+            try:
+                cmd: dict = self.control_queue.get_nowait()
+                cmd_type: str = cmd.get("type", "")
+                if cmd_type == "pause":
+                    self.state.is_paused = True
+                    self.logger.info("Dashboard: PAUSED")
+                elif cmd_type == "resume":
+                    self.state.is_paused = False
+                    self.state.consecutive_losses = 0  # reset streak on manual resume
+                    self.logger.info("Dashboard: RESUMED")
+                elif cmd_type == "set_exposure":
+                    value: float = cmd.get("value", self.config.max_exposure_pct)
+                    self._exposure_override = max(0.05, min(value, 0.10))
+                    self.logger.info(
+                        f"Dashboard: exposure cap set to {self._exposure_override:.0%}"
+                    )
+                elif cmd_type == "withdraw":
+                    amount: float = cmd.get("amount", 0.0)
+                    self.logger.info(
+                        f"Dashboard: withdraw request ${amount:.2f} "
+                        "(not yet implemented — manual transfer required)"
+                    )
+            except queue_mod.Empty:
+                break
 
     # --- Rich Console Logging ---
 
@@ -344,6 +411,14 @@ class AsyncBot:
         while True:
             cycle_start: float = time.perf_counter()
 
+            # Poll dashboard control commands (non-blocking)
+            self._poll_controls()
+
+            # If paused by dashboard, idle without consuming ticks aggressively
+            if self.state.is_paused:
+                await asyncio.sleep(0.5)
+                continue
+
             # Block until next tick arrives from Binance
             tick: PriceTick = await self.tick_queue.get()
 
@@ -370,6 +445,13 @@ class AsyncBot:
             self.state.peak_balance = max(
                 self.state.peak_balance, self.state.current_balance
             )
+
+            # Push live balance to dashboard
+            self._push_event({
+                "type": "balance",
+                "timestamp": time.time(),
+                "balance": self.state.current_balance,
+            })
 
             # Hard stop: drawdown exceeds 25%
             if self._check_drawdown():
@@ -429,6 +511,10 @@ class AsyncBot:
                     self.state.total_trades += 1  # count for statistics
                 else:
                     # Live mode: place the actual order
+                    # Use dashboard exposure override if set, else config default
+                    exposure: float = (
+                        self._exposure_override or self.config.max_exposure_pct
+                    )
                     result: Optional[OrderResult] = await loop.run_in_executor(
                         None,
                         self.executor.place_maker_limit,
@@ -436,16 +522,49 @@ class AsyncBot:
                         signal.direction,
                         signal.kelly_fraction,
                         implied_prob_up,
+                        exposure,
                     )
                     if result:
                         self.state.total_trades += 1
                         self._update_rebate_tracker(result)
                         self._update_compounding()
+                        # Push trade event to dashboard
+                        self._push_event({
+                            "type": "trade",
+                            "timestamp": time.time(),
+                            "direction": signal.direction,
+                            "edge": signal.edge,
+                            "z_score": signal.z_score,
+                            "model_prob": signal.true_prob,
+                            "implied_prob": signal.implied_prob,
+                            "kelly_fraction": signal.kelly_fraction,
+                            "fill_price": result.price,
+                            "size": result.size,
+                            "mc_ev": signal.mc_ev,
+                            "outcome": None,
+                            "gas_paid": self.config.gas_buffer_usdc,
+                            "net_pnl": None,
+                        })
 
             # Step 8: Rich console output
             table: Table = self._build_status_table(signal, cycle_ms)
             self.console.print(table)
             self.cycle_times.append(cycle_ms)
+
+            # Push status snapshot to dashboard
+            self._push_event({
+                "type": "status",
+                "timestamp": time.time(),
+                "total_trades": self.state.total_trades,
+                "wins": self.state.wins,
+                "losses": self.state.losses,
+                "consecutive_losses": self.state.consecutive_losses,
+                "peak_balance": self.state.peak_balance,
+                "current_balance": self.state.current_balance,
+                "is_paused": self.state.is_paused,
+                "compounding_active": self.state.compounding_active,
+                "cycle_ms": cycle_ms,
+            })
 
     async def run(self) -> None:
         """Main entry point — launches all concurrent async tasks.
@@ -515,7 +634,11 @@ class AsyncBot:
 
 
 async def main() -> None:
-    """Entry point: load config, create bot, run."""
+    """Entry point: load config, create bot, run.
+
+    If ENABLE_DASHBOARD=true in .env, launches a Streamlit dashboard
+    in a separate process connected via multiprocessing queues.
+    """
     load_dotenv()
 
     # Configure logging with timestamps for latency analysis
@@ -527,8 +650,35 @@ async def main() -> None:
 
     config: Config = load_config()
     test_mode: bool = os.getenv("TEST_MODE", "true").lower() == "true"
+    enable_dashboard: bool = os.getenv("ENABLE_DASHBOARD", "false").lower() == "true"
 
-    bot: AsyncBot = AsyncBot(config, test_mode=test_mode)
+    # Create inter-process queues for dashboard communication
+    event_queue: Optional[multiprocessing.Queue] = None
+    control_queue: Optional[multiprocessing.Queue] = None
+    dashboard_proc: Optional[multiprocessing.Process] = None
+
+    if enable_dashboard:
+        event_queue = multiprocessing.Queue(maxsize=10000)
+        control_queue = multiprocessing.Queue(maxsize=100)
+
+        from dashboard import run_dashboard
+
+        dashboard_proc = multiprocessing.Process(
+            target=run_dashboard,
+            args=(event_queue, control_queue, config.private_key),
+            daemon=True,  # auto-killed when main process exits
+        )
+        dashboard_proc.start()
+        logging.getLogger("Bot").info(
+            "Dashboard launched at http://localhost:8501"
+        )
+
+    bot: AsyncBot = AsyncBot(
+        config,
+        test_mode=test_mode,
+        event_queue=event_queue,
+        control_queue=control_queue,
+    )
     await bot.run()
 
 

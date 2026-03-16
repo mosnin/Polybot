@@ -143,7 +143,11 @@ class OrderExecutor:
         return self.client.get_order_book(token_id)
 
     def _compute_order_size(
-        self, balance: float, kelly_fraction: float, price: float
+        self,
+        balance: float,
+        kelly_fraction: float,
+        price: float,
+        max_exposure_pct: float = 0.10,
     ) -> Optional[float]:
         """Compute order size in conditional tokens with all safety guards.
 
@@ -152,19 +156,21 @@ class OrderExecutor:
            (never touch the safety floor — it's our survival guarantee)
         2. Dollar risk = available * kelly_fraction
            (Kelly tells us the optimal fraction of bankroll to risk)
-        3. Clamp to 5%-10% of total balance
+        3. Clamp to 5%-max_exposure_pct of total balance
            (hard limits prevent model errors from oversizing)
         4. Size in tokens = dollar_risk / price
            (convert dollar amount to token quantity)
 
-        The clamping to 5-10% is a second safety net beyond Kelly.
+        The clamping is a second safety net beyond Kelly.
         Even if the model outputs a high Kelly fraction due to a
         spurious edge, the clamp prevents catastrophic position sizes.
 
         Args:
-            balance: Current USDC balance
+            balance: Current USDC balance (live from get_current_balance)
             kelly_fraction: Optimal bet fraction from model (0 to 0.25)
             price: Order price per token
+            max_exposure_pct: Maximum exposure as fraction of balance (0.05-0.10),
+                              adjustable via dashboard slider
 
         Returns:
             Order size in tokens, or None if insufficient balance
@@ -180,9 +186,9 @@ class OrderExecutor:
         # Kelly-sized dollar risk
         dollar_risk: float = available * kelly_fraction
 
-        # Hard clamp to 5-10% of total balance regardless of Kelly output
+        # Hard clamp to 5%-max_exposure_pct of total balance regardless of Kelly output
         min_risk: float = balance * 0.05
-        max_risk: float = balance * 0.10
+        max_risk: float = balance * max_exposure_pct
         dollar_risk = max(min(dollar_risk, max_risk), min_risk)
 
         # Never exceed available capital
@@ -201,6 +207,7 @@ class OrderExecutor:
         direction: str,
         kelly_fraction: float,
         midpoint: float,
+        max_exposure_pct: float = 0.10,
     ) -> Optional[OrderResult]:
         """Place a maker limit order targeting passive fills and rebates.
 
@@ -225,6 +232,7 @@ class OrderExecutor:
             direction: "UP" or "DOWN" (for logging)
             kelly_fraction: Position size fraction from model
             midpoint: Current CLOB midpoint price
+            max_exposure_pct: Maximum exposure cap, adjustable via dashboard
 
         Returns:
             OrderResult if successfully posted, None on failure
@@ -242,7 +250,7 @@ class OrderExecutor:
             price = max(0.01, min(price, 0.99))
 
         size: Optional[float] = self._compute_order_size(
-            balance, kelly_fraction, price
+            balance, kelly_fraction, price, max_exposure_pct
         )
         if size is None:
             self.logger.warning(

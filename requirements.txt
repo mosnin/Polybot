@@ -6,3 +6,6 @@ aiohttp>=3.9.0
 python-dotenv>=1.0.0
 web3>=6.0.0
 rich>=13.0.0
+streamlit>=1.30.0
+matplotlib>=3.7.0
+pandas>=2.0.0

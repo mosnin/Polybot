@@ -44,6 +44,13 @@ from config import Config, load_config
 from data_feed import BinanceWebSocket, GammaMarketFinder, MarketWindow, PriceTick
 from executor import OrderExecutor, OrderResult
 from model import BayesianModel, Signal
+from performance import LatencyMonitor, adaptive_z_score, rebate_optimizer
+
+# Redis is optional — bot works without it, but loses equity history persistence
+try:
+    import redis as _redis_lib
+except ImportError:
+    _redis_lib = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -119,6 +126,7 @@ class AsyncBot:
             min_edge=config.min_edge_threshold,
             round_trip_cost=config.round_trip_cost_pct,
             redis_url=config.redis_url,
+            decay_factor=config.decay_factor,
         )
         self.executor: OrderExecutor = OrderExecutor(
             private_key=config.private_key,
@@ -138,9 +146,29 @@ class AsyncBot:
         # Cycle latency tracking for performance monitoring
         self.cycle_times: Deque[float] = deque(maxlen=100)
 
+        # Latency monitor for auto-adjusting poll interval during high-vol
+        self.latency_monitor: LatencyMonitor = LatencyMonitor(self.logger)
+
         # Track last trade's prediction for win/loss outcome resolution.
         # Set when an order is placed; resolved when the window ends (new window arrives).
         self._pending_prediction: Optional[dict] = None  # {"direction": str, "entry_price": float}
+
+        # Redis connection for equity history + bot state persistence (optional).
+        # Shares the same Redis URL as the model for state continuity across restarts.
+        self._redis = None
+        self._redis_save_interval: float = 10.0  # seconds between equity saves
+        self._last_redis_save: float = 0.0
+        if _redis_lib is not None and config.redis_url:
+            try:
+                self._redis = _redis_lib.Redis.from_url(
+                    config.redis_url, socket_connect_timeout=1, socket_timeout=1
+                )
+                self._redis.ping()
+                self.logger.info("Redis connected for equity history persistence")
+                self._load_equity_from_redis()
+            except Exception as e:
+                self.logger.warning(f"Redis unavailable for equity: {e}")
+                self._redis = None
 
     # --- Safety Controls ---
 
@@ -289,6 +317,69 @@ class AsyncBot:
             except Exception:
                 pass  # never block the bot for dashboard updates
 
+    def _save_equity_to_redis(self) -> None:
+        """Persist equity history and bot state to Redis.
+
+        Throttled to every 10 seconds to avoid Redis overhead on every tick.
+        Saves: equity_history, wins, losses, consecutive_losses, total_trades,
+        peak_balance, daily_maker_volume, compounding_active.
+
+        Fails silently — never blocks the trading loop for persistence.
+        """
+        if self._redis is None:
+            return
+        now: float = time.time()
+        if now - self._last_redis_save < self._redis_save_interval:
+            return
+        try:
+            import json
+            state: str = json.dumps({
+                "equity_history": self.state.equity_history[-50000:],
+                "wins": self.state.wins,
+                "losses": self.state.losses,
+                "consecutive_losses": self.state.consecutive_losses,
+                "total_trades": self.state.total_trades,
+                "peak_balance": self.state.peak_balance,
+                "daily_maker_volume": self.state.daily_maker_volume,
+                "compounding_active": self.state.compounding_active,
+            })
+            self._redis.set("polybot:bot_state", state)
+            self._last_redis_save = now
+        except Exception:
+            pass  # never block the trading loop for persistence
+
+    def _load_equity_from_redis(self) -> None:
+        """Restore equity history and bot state from Redis on startup.
+
+        Ensures zero edge history loss across restarts — the compounding
+        gate, drawdown tracking, and daily return calculation all resume
+        from where they left off.
+        """
+        if self._redis is None:
+            return
+        try:
+            import json
+            raw = self._redis.get("polybot:bot_state")
+            if raw is None:
+                return
+            data: dict = json.loads(raw)
+            self.state.equity_history = data.get("equity_history", [])
+            self.state.wins = int(data.get("wins", 0))
+            self.state.losses = int(data.get("losses", 0))
+            self.state.consecutive_losses = int(data.get("consecutive_losses", 0))
+            self.state.total_trades = int(data.get("total_trades", 0))
+            self.state.peak_balance = float(data.get("peak_balance", 0.0))
+            self.state.daily_maker_volume = float(data.get("daily_maker_volume", 0.0))
+            self.state.compounding_active = bool(data.get("compounding_active", False))
+            self.logger.info(
+                f"Restored bot state from Redis "
+                f"(trades={self.state.total_trades}, "
+                f"wins={self.state.wins}, "
+                f"equity_points={len(self.state.equity_history)})"
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not load Redis bot state: {e}")
+
     def _poll_controls(self) -> None:
         """Non-blocking poll for dashboard control commands.
 
@@ -363,11 +454,15 @@ class AsyncBot:
         table.add_row("Consec. Losses", str(self.state.consecutive_losses))
         table.add_row("Compounding", "ON" if self.state.compounding_active else "OFF")
 
-        # Latency metrics
+        # Latency metrics (from LatencyMonitor)
         table.add_row("Cycle Latency", f"{cycle_ms:.1f}ms")
-        if self.cycle_times:
-            avg_latency: float = sum(self.cycle_times) / len(self.cycle_times)
-            table.add_row("Avg Latency", f"{avg_latency:.1f}ms")
+        if self.latency_monitor.cycle_times:
+            table.add_row("Avg Latency", f"{self.latency_monitor.avg_ms:.1f}ms")
+            table.add_row(
+                "Poll Interval",
+                f"{self.latency_monitor.poll_interval:.1f}s"
+                + (" [HIGH-VOL]" if self.latency_monitor.poll_interval < 1.0 else ""),
+            )
 
         # Rebate tracking
         table.add_row("Maker Volume", f"${self.state.daily_maker_volume:.2f}")
@@ -579,12 +674,22 @@ class AsyncBot:
                 self.logger.error(f"Midpoint/orderbook fetch failed: {e}")
                 continue
 
-            # Step 6: Run full evaluation pipeline with liquidity-aware z-score
+            # Step 6: Compute adaptive min-edge based on real-time CLOB depth.
+            # Deep books → lower threshold (more trades in liquid conditions).
+            # Thin books → higher threshold (conservative in low liquidity).
+            dynamic_min_edge: float = adaptive_z_score(
+                order_book,
+                base_min_edge=self.config.min_edge_threshold,
+                high_depth_threshold=self.config.rebate_depth_threshold,
+            )
+
+            # Run full evaluation pipeline with liquidity-aware z-score
             signal: Optional[Signal] = self.model.evaluate(
                 current_price=tick.last_price,
                 implied_prob_up=implied_prob_up,
                 remaining_seconds=remaining,
                 order_book=order_book,
+                min_edge_override=dynamic_min_edge,
             )
 
             cycle_ms: float = (time.perf_counter() - cycle_start) * 1000
@@ -621,20 +726,45 @@ class AsyncBot:
                     if not self.state.compounding_active:
                         balance_cap = self.config.starting_capital
 
-                    # Low volatility → batch orders at multiple price levels
-                    # Normal volatility → single maker limit order
-                    use_batch: bool = (
-                        self.model.volatility < self.config.low_vol_threshold
-                        and self.model.volatility > 0
-                    )
-
                     # Record prediction for outcome resolution at window end
                     self._pending_prediction = {
                         "direction": signal.direction,
                         "entry_price": tick.last_price,
                     }
 
-                    if use_batch:
+                    # Determine order strategy: rebate-optimized batch vs standard.
+                    # rebate_optimizer checks CLOB dollar depth and returns optimal
+                    # pricing/batching config. Falls back to single order in thin books.
+                    rebate_cfg: dict = rebate_optimizer(
+                        order_book,
+                        midpoint=implied_prob_up,
+                        depth_threshold=self.config.rebate_depth_threshold,
+                        rebate_offset=self.config.rebate_price_offset,
+                    )
+
+                    # Low-vol batch override: if volatility is very low, force batch
+                    # even if depth doesn't meet rebate threshold
+                    use_low_vol_batch: bool = (
+                        self.model.volatility < self.config.low_vol_threshold
+                        and self.model.volatility > 0
+                        and not rebate_cfg["use_rebate_batch"]
+                    )
+
+                    if rebate_cfg["use_rebate_batch"]:
+                        # Rebate-optimized: 3 levels at tighter offset (0.005)
+                        results = await loop.run_in_executor(
+                            None,
+                            self.executor.place_rebate_optimized_orders,
+                            token_id,
+                            signal.direction,
+                            signal.kelly_fraction,
+                            implied_prob_up,
+                            rebate_cfg,
+                            exposure,
+                            balance_cap,
+                        )
+                    elif use_low_vol_batch:
+                        # Low-vol standard batch: 3 levels at standard offset (0.01)
                         results = await loop.run_in_executor(
                             None,
                             self.executor.place_batch_maker_limits,
@@ -646,28 +776,9 @@ class AsyncBot:
                             3,  # levels
                             balance_cap,
                         )
-                        for batch_result in results:
-                            self.state.total_trades += 1
-                            self._update_rebate_tracker(batch_result)
-                            self._update_compounding()
-                            self._push_event({
-                                "type": "trade",
-                                "timestamp": time.time(),
-                                "direction": signal.direction,
-                                "edge": signal.edge,
-                                "z_score": signal.z_score,
-                                "model_prob": signal.true_prob,
-                                "implied_prob": signal.implied_prob,
-                                "kelly_fraction": signal.kelly_fraction,
-                                "fill_price": batch_result.price,
-                                "size": batch_result.size,
-                                "mc_ev": signal.mc_ev,
-                                "outcome": None,
-                                "gas_paid": self.config.gas_buffer_usdc,
-                                "net_pnl": None,
-                            })
                     else:
-                        result: Optional[OrderResult] = await loop.run_in_executor(
+                        # Standard single maker limit
+                        single_result: Optional[OrderResult] = await loop.run_in_executor(
                             None,
                             self.executor.place_maker_limit,
                             token_id,
@@ -677,12 +788,12 @@ class AsyncBot:
                             exposure,
                             balance_cap,
                         )
+                        results = [single_result] if single_result else []
 
-                    if not use_batch and result:
+                    for order_result in results:
                         self.state.total_trades += 1
-                        self._update_rebate_tracker(result)
+                        self._update_rebate_tracker(order_result)
                         self._update_compounding()
-                        # Push trade event to dashboard
                         self._push_event({
                             "type": "trade",
                             "timestamp": time.time(),
@@ -692,18 +803,25 @@ class AsyncBot:
                             "model_prob": signal.true_prob,
                             "implied_prob": signal.implied_prob,
                             "kelly_fraction": signal.kelly_fraction,
-                            "fill_price": result.price,
-                            "size": result.size,
+                            "fill_price": order_result.price,
+                            "size": order_result.size,
                             "mc_ev": signal.mc_ev,
                             "outcome": None,
                             "gas_paid": self.config.gas_buffer_usdc,
                             "net_pnl": None,
                         })
 
-            # Step 8: Rich console output
+            # Step 8: Latency monitor — record cycle, warn if >80ms, auto-tune poll
+            self.latency_monitor.record(cycle_ms)
+            self.latency_monitor.auto_adjust_poll_interval(self.model.volatility)
+
+            # Step 9: Rich console output
             table: Table = self._build_status_table(signal, cycle_ms)
             self.console.print(table)
             self.cycle_times.append(cycle_ms)
+
+            # Step 10: Persist equity history to Redis (throttled to every 10s)
+            self._save_equity_to_redis()
 
             # Push status snapshot to dashboard
             self._push_event({

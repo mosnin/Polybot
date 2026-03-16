@@ -101,6 +101,25 @@ class Config:
     # increases fill probability and captures rebates on each.
     low_vol_threshold: float = 0.0005
 
+    # --- Performance Tuning (performance.py) ---
+    # Exponential decay factor for Bayesian tick weighting.
+    # 0.9 means each tick older than the newest is weighted 10% less.
+    decay_factor: float = 0.9
+
+    # MC paths during high volatility (>2% per-tick std).
+    # Doubling to 2000 improves tail-risk accuracy in volatile regimes.
+    high_vol_mc_paths: int = 2000
+
+    # Dollar depth threshold for rebate-optimized batch ordering.
+    # When CLOB depth exceeds this, orders are placed at tighter offset
+    # to maximize maker rebate classification probability.
+    rebate_depth_threshold: float = 50000.0
+
+    # Price offset from midpoint in rebate-optimized mode.
+    # 0.005 (half a cent) is tighter than the normal 0.01, increasing
+    # fill probability while still qualifying as passive maker orders.
+    rebate_price_offset: float = 0.005
+
     # --- Polygon Contract Addresses ---
     # USDC.e (bridged) on Polygon — primary collateral for all Polymarket trading.
     # 6 decimals: 1 USDC = 1_000_000 wei units.

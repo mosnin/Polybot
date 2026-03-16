@@ -402,6 +402,107 @@ class OrderExecutor:
 
         return results
 
+    def place_rebate_optimized_orders(
+        self,
+        token_id: str,
+        direction: str,
+        kelly_fraction: float,
+        midpoint: float,
+        rebate_config: dict,
+        max_exposure_pct: float = 0.10,
+        balance_cap: Optional[float] = None,
+    ) -> list:
+        """Place orders using rebate-optimized pricing from performance.rebate_optimizer.
+
+        When CLOB dollar depth exceeds $50k, batches 3 orders at midpoint - 0.005
+        (half the normal offset) to maximize maker rebate capture. The tighter
+        offset keeps orders closer to mid for higher fill probability while
+        still qualifying as passive (maker) orders.
+
+        Falls back to standard single order placement when depth is insufficient.
+
+        Args:
+            token_id: Which conditional token to buy
+            direction: "UP" or "DOWN" (for logging)
+            kelly_fraction: Position size fraction from model
+            midpoint: Current CLOB midpoint price
+            rebate_config: Dict from rebate_optimizer() with keys:
+                use_rebate_batch, price_offset, levels, dollar_depth
+            max_exposure_pct: Maximum exposure cap
+            balance_cap: If set, cap effective balance for sizing
+
+        Returns:
+            List of OrderResult for successfully posted orders
+        """
+        if not rebate_config.get("use_rebate_batch", False):
+            # Not enough depth for rebate batching — use standard single order
+            result = self.place_maker_limit(
+                token_id, direction, kelly_fraction, midpoint,
+                max_exposure_pct, balance_cap,
+            )
+            return [result] if result else []
+
+        balance: float = self.get_current_balance()
+        if balance_cap is not None:
+            balance = min(balance, balance_cap)
+
+        price_offset: float = rebate_config.get("price_offset", 0.005)
+        levels: int = rebate_config.get("levels", 3)
+
+        best_price: float = round(midpoint - price_offset, 2)
+        if best_price <= 0.0 or best_price >= 1.0:
+            best_price = round(midpoint, 2)
+            best_price = max(0.01, min(best_price, 0.99))
+
+        total_size: Optional[float] = self._compute_order_size(
+            balance, kelly_fraction, best_price, max_exposure_pct
+        )
+        if total_size is None:
+            self.logger.warning(
+                f"Rebate batch skipped: insufficient balance for {direction}"
+            )
+            return []
+
+        per_level_size: float = round(total_size / levels, 2)
+        if per_level_size < 0.01:
+            return []
+
+        results: list = []
+        for i in range(levels):
+            price: float = round(midpoint - price_offset * (i + 1), 2)
+            if price <= 0.0 or price >= 1.0:
+                continue
+
+            try:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=per_level_size,
+                    side=BUY,
+                )
+                signed_order = self.client.create_order(order_args)
+                response = self.client.post_order(signed_order, OrderType.GTC)
+
+                result = OrderResult(
+                    order_id=response.get("orderID", response.get("id", "unknown")),
+                    side=BUY,
+                    price=price,
+                    size=per_level_size,
+                    token_id=token_id,
+                    timestamp=time.time(),
+                    status="posted",
+                )
+                self.active_orders.append(result)
+                results.append(result)
+                self.logger.info(
+                    f"Rebate batch L{i}: {direction} {per_level_size:.2f} "
+                    f"@ {price:.3f} (depth=${rebate_config.get('dollar_depth', 0):.0f})"
+                )
+            except Exception as e:
+                self.logger.error(f"Rebate batch L{i} failed: {e}")
+
+        return results
+
     def cancel_stale_orders(self, max_age_seconds: float = 10.0) -> None:
         """Cancel orders older than max_age_seconds.
 

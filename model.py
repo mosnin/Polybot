@@ -20,9 +20,11 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import numpy as np
+
+from performance import apply_decay_weights, get_dynamic_mc_paths
 
 # Redis is optional — model works without it, but loses state persistence
 try:
@@ -91,6 +93,7 @@ class BayesianModel:
         min_edge: float = 0.02,
         round_trip_cost: float = 0.003,
         redis_url: Optional[str] = None,
+        decay_factor: float = 0.9,
     ) -> None:
         """Initialize with uninformative beta prior.
 
@@ -102,6 +105,8 @@ class BayesianModel:
                              Maker fills reduce this, creating hidden alpha.
             redis_url: Optional Redis URL for state persistence across restarts.
                        If None or redis-py not installed, persistence is disabled.
+            decay_factor: Exponential decay for tick weighting (0.9 = 10% decay).
+                          Recent ticks are weighted heavier in alpha/beta computation.
         """
         # Beta distribution parameters — start uninformative
         self.alpha: float = 1.0
@@ -109,10 +114,16 @@ class BayesianModel:
 
         self.min_edge: float = min_edge
         self.round_trip_cost: float = round_trip_cost
+        self.decay_factor: float = decay_factor
 
         # Rolling price history for volatility calculation.
         # Deque with maxlen auto-evicts old observations.
         self.price_history: Deque[float] = deque(maxlen=self.VOLATILITY_WINDOW)
+
+        # Tick direction history for exponential decay weighting.
+        # +1 = up, -1 = down, 0 = flat. Used by apply_decay_weights().
+        self.tick_directions: Deque[int] = deque(maxlen=self.VOLATILITY_WINDOW)
+
         self.tick_count: int = 0
         self.logger: logging.Logger = logging.getLogger("Model")
 
@@ -143,6 +154,7 @@ class BayesianModel:
         self.alpha = 1.0
         self.beta = 1.0
         self.price_history.clear()
+        self.tick_directions.clear()
         self.tick_count = 0
         self._save_to_redis()
 
@@ -168,12 +180,17 @@ class BayesianModel:
             return  # first tick — no direction to observe
 
         if current_price > previous_price:
-            # Favorable observation: price moved up → strengthen P(up)
-            self.alpha += 1.0
+            self.tick_directions.append(1)
         elif current_price < previous_price:
-            # Unfavorable observation: price moved down → strengthen P(down)
-            self.beta += 1.0
-        # Exact equality: no information gained, skip update
+            self.tick_directions.append(-1)
+        else:
+            self.tick_directions.append(0)
+
+        # Recompute alpha/beta using exponential decay weighting.
+        # Recent ticks get weight ~1.0, older ticks decay by factor^age.
+        self.alpha, self.beta = apply_decay_weights(
+            list(self.tick_directions), self.decay_factor
+        )
 
         self._save_to_redis()
 
@@ -191,6 +208,7 @@ class BayesianModel:
                 "alpha": self.alpha,
                 "beta": self.beta,
                 "price_history": list(self.price_history),
+                "tick_directions": list(self.tick_directions),
                 "tick_count": self.tick_count,
             })
             self._redis.set("polybot:model_state", state)
@@ -216,6 +234,9 @@ class BayesianModel:
             self.beta = float(data["beta"])
             self.price_history = deque(
                 data["price_history"], maxlen=self.VOLATILITY_WINDOW
+            )
+            self.tick_directions = deque(
+                data.get("tick_directions", []), maxlen=self.VOLATILITY_WINDOW
             )
             self.tick_count = int(data["tick_count"])
             self.logger.info(
@@ -380,9 +401,13 @@ class BayesianModel:
         # Assuming ~1 tick/second, vol scales by sqrt(time) per GBM.
         vol_scaled: float = vol * np.sqrt(remaining_seconds)
 
+        # Dynamically select MC path count: 2000 during high-vol (>2%),
+        # 1000 otherwise. More paths in volatile regimes improves tail accuracy.
+        mc_paths: int = get_dynamic_mc_paths(vol, self.MC_PATHS)
+
         # Vectorized GBM: S(T) = S(0) * exp((−σ²/2)T + σ√T * Z)
-        # where Z ~ N(0,1). We compute all 1000 paths in one operation.
-        z: np.ndarray = np.random.standard_normal(self.MC_PATHS)
+        # where Z ~ N(0,1). We compute all paths in one operation.
+        z: np.ndarray = np.random.standard_normal(mc_paths)
         terminal_prices: np.ndarray = current_price * np.exp(
             -0.5 * vol_scaled**2 + vol_scaled * z
         )
@@ -439,6 +464,7 @@ class BayesianModel:
         implied_prob_up: float,
         remaining_seconds: float,
         order_book: Optional[dict] = None,
+        min_edge_override: Optional[float] = None,
     ) -> Optional[Signal]:
         """Full evaluation pipeline: Bayesian posterior → z-score → MC → Kelly.
 
@@ -486,10 +512,11 @@ class BayesianModel:
         # Net edge after subtracting round-trip costs
         edge: float = directional_true - directional_implied - self.round_trip_cost
 
-        # Gate 1: minimum edge threshold
+        # Gate 1: minimum edge threshold (dynamically adjustable via adaptive_z_score)
         # Below this, the signal-to-noise ratio is too low to overcome
         # execution slippage and model uncertainty
-        if edge < self.min_edge:
+        active_min_edge: float = min_edge_override if min_edge_override is not None else self.min_edge
+        if edge < active_min_edge:
             return None
 
         # Z-score with dynamic liquidity adjustment

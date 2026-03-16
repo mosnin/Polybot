@@ -15,6 +15,7 @@ positive expected value even in the tail scenarios.
 All computations are vectorized numpy — total evaluate() latency target <30ms.
 """
 
+import json
 import logging
 import time
 from collections import deque
@@ -22,6 +23,12 @@ from dataclasses import dataclass
 from typing import Deque, Optional, Tuple
 
 import numpy as np
+
+# Redis is optional — model works without it, but loses state persistence
+try:
+    import redis as _redis_lib
+except ImportError:
+    _redis_lib = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -75,7 +82,10 @@ class BayesianModel:
     MC_PATHS: int = 1000  # Monte Carlo simulation paths
 
     def __init__(
-        self, min_edge: float = 0.02, round_trip_cost: float = 0.003
+        self,
+        min_edge: float = 0.02,
+        round_trip_cost: float = 0.003,
+        redis_url: Optional[str] = None,
     ) -> None:
         """Initialize with uninformative beta prior.
 
@@ -85,6 +95,8 @@ class BayesianModel:
             round_trip_cost: Total cost of entering + exiting position.
                              0.3% assumes worst-case taker fees both sides.
                              Maker fills reduce this, creating hidden alpha.
+            redis_url: Optional Redis URL for state persistence across restarts.
+                       If None or redis-py not installed, persistence is disabled.
         """
         # Beta distribution parameters — start uninformative
         self.alpha: float = 1.0
@@ -99,6 +111,23 @@ class BayesianModel:
         self.tick_count: int = 0
         self.logger: logging.Logger = logging.getLogger("Model")
 
+        # Redis connection for Bayesian state persistence (optional).
+        # Sub-1ms SET on localhost — no impact on 80ms cycle budget.
+        self._redis = None
+        if _redis_lib is not None and redis_url:
+            try:
+                self._redis = _redis_lib.Redis.from_url(
+                    redis_url, socket_connect_timeout=1, socket_timeout=1
+                )
+                self._redis.ping()
+                self.logger.info("Redis connected for model state persistence")
+            except Exception as e:
+                self.logger.warning(f"Redis unavailable, persistence disabled: {e}")
+                self._redis = None
+
+        # Restore state from Redis if available (silent no-op if Redis is down)
+        self._load_from_redis()
+
     def reset(self) -> None:
         """Reset to uninformative prior for new market window.
 
@@ -110,6 +139,7 @@ class BayesianModel:
         self.beta = 1.0
         self.price_history.clear()
         self.tick_count = 0
+        self._save_to_redis()
 
     def update(self, current_price: float, previous_price: Optional[float]) -> None:
         """Bayesian update on a new price observation.
@@ -139,6 +169,56 @@ class BayesianModel:
             # Unfavorable observation: price moved down → strengthen P(down)
             self.beta += 1.0
         # Exact equality: no information gained, skip update
+
+        self._save_to_redis()
+
+    def _save_to_redis(self) -> None:
+        """Persist current Bayesian state to Redis.
+
+        Called after every update() and reset(). Synchronous but fast —
+        localhost SET with ~200-byte payload completes in <0.5ms.
+        Fails silently so the model always continues operating.
+        """
+        if self._redis is None:
+            return
+        try:
+            state: str = json.dumps({
+                "alpha": self.alpha,
+                "beta": self.beta,
+                "price_history": list(self.price_history),
+                "tick_count": self.tick_count,
+            })
+            self._redis.set("polybot:model_state", state)
+        except Exception:
+            pass  # never block the trading loop for persistence
+
+    def _load_from_redis(self) -> None:
+        """Restore Bayesian state from Redis on startup.
+
+        If Redis has prior state, the model resumes with accumulated
+        evidence instead of starting from an uninformative prior.
+        This preserves winning edge continuity across process restarts.
+        Fails silently — uses default uninformative prior on any error.
+        """
+        if self._redis is None:
+            return
+        try:
+            raw = self._redis.get("polybot:model_state")
+            if raw is None:
+                return
+            data: dict = json.loads(raw)
+            self.alpha = float(data["alpha"])
+            self.beta = float(data["beta"])
+            self.price_history = deque(
+                data["price_history"], maxlen=self.VOLATILITY_WINDOW
+            )
+            self.tick_count = int(data["tick_count"])
+            self.logger.info(
+                f"Restored model state from Redis "
+                f"(alpha={self.alpha:.1f}, beta={self.beta:.1f}, ticks={self.tick_count})"
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not load Redis state: {e}")
 
     @property
     def true_prob_up(self) -> float:

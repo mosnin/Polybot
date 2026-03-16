@@ -116,6 +116,11 @@ class Config:
     # Bridge API base URL for withdrawal operations
     bridge_api_base: str = "https://clob.polymarket.com"
 
+    # Redis URL for Bayesian model state persistence across restarts (optional).
+    # When set, the model saves alpha/beta/tick state to Redis on every update
+    # and restores it on startup, preserving winning edge continuity.
+    redis_url: str = ""
+
 
 def load_config() -> Config:
     """Factory function that reads .env and returns a validated Config.
@@ -125,6 +130,7 @@ def load_config() -> Config:
     """
     private_key: str = os.getenv("POLYGON_PRIVATE_KEY", "")
     rpc_url: str = os.getenv("ALCHEMY_RPC_URL", "")
+    redis_url: str = os.getenv("REDIS_URL", "")
 
     if not private_key or private_key == "0xYOUR_PRIVATE_KEY_HERE":
         raise ValueError(
@@ -137,4 +143,8 @@ def load_config() -> Config:
             "get a free key at https://dashboard.alchemy.com"
         )
 
-    return Config(private_key=private_key, alchemy_rpc_url=rpc_url)
+    return Config(
+        private_key=private_key,
+        alchemy_rpc_url=rpc_url,
+        redis_url=redis_url,
+    )

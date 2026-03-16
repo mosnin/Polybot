@@ -114,6 +114,7 @@ class AsyncBot:
         self.model: BayesianModel = BayesianModel(
             min_edge=config.min_edge_threshold,
             round_trip_cost=config.round_trip_cost_pct,
+            redis_url=config.redis_url,
         )
         self.executor: OrderExecutor = OrderExecutor(
             private_key=config.private_key,

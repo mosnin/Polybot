@@ -6,7 +6,7 @@ window through the full Bayesian + z-score + Monte Carlo pipeline, and
 outputs comprehensive performance metrics.
 
 Supports two modes:
-1. **Synthetic backtest** (``run_backtest``): Uses Binance perpetual ticks with
+1. **Synthetic backtest** (``run_backtest``): Uses Bybit perpetual ticks with
    synthesized implied probabilities.  Fast (~30 s), no CLOB connection needed.
 2. **Real Polymarket backtest** (``run_real_backtest``): Discovers actual past
    5-min BTC markets via Gamma API, fetches real CLOB price history, and uses
@@ -70,7 +70,7 @@ def _cache_is_valid(path: str) -> bool:
 
 
 async def download_historical_ticks(days: int = 30) -> List[dict]:
-    """Download 1-second BTC/USDT perpetual candles from Binance via ccxt.
+    """Download 1-second BTC/USDT perpetual candles from Bybit via ccxt.
 
     Fetches ``days`` worth of 1-second OHLCV data, extracting the close price
     as the tick price.  Results are cached to disk for 24 hours to avoid
@@ -91,11 +91,11 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
         with open(cache_file, "r") as f:
             return json.load(f)
 
-    logger.info(f"Downloading {days} days of 1-second BTC ticks from Binance...")
+    logger.info(f"Downloading {days} days of 1-second BTC ticks from Bybit...")
 
     import ccxt
 
-    exchange = ccxt.binance({
+    exchange = ccxt.bybit({
         "options": {"defaultType": "swap"},
         "enableRateLimit": True,
     })
@@ -356,7 +356,7 @@ def _compute_backtest_metrics(
     total_windows: int,
     config: Config,
     initial_timestamp: Optional[int] = None,
-    data_source: str = "binance_synthetic",
+    data_source: str = "bybit_synthetic",
 ) -> dict:
     """Compute backtest summary metrics from a list of raw trade signals.
 
@@ -542,7 +542,7 @@ async def run_backtest(
         total_windows=total_windows,
         config=config,
         initial_timestamp=ticks[0]["timestamp"],
-        data_source="binance_synthetic",
+        data_source="bybit_synthetic",
     )
 
 
@@ -814,7 +814,7 @@ def simulate_real_window(
     by the actual market resolution, not a price comparison.
 
     Args:
-        btc_ticks: Binance 1s BTC prices for this 5-min window
+        btc_ticks: Bybit 1s BTC prices for this 5-min window
         clob_prices: CLOB minute-by-minute prices [{"t": unix, "p": float}]
         resolution: "YES" or "NO" — the actual market outcome
         config: Bot configuration
@@ -902,7 +902,7 @@ async def run_real_backtest(
     """Run backtest using real Polymarket CLOB data and market resolutions.
 
     Pipeline:
-    1. Download Binance 1s ticks (reuse ``download_historical_ticks``)
+    1. Download Bybit 1s ticks (reuse ``download_historical_ticks``)
     2. Discover real Polymarket 5-min BTC markets via Gamma API
     3. Fetch CLOB price history for each discovered market
     4. Align BTC ticks with CLOB windows

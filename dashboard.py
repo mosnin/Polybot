@@ -195,10 +195,10 @@ def render_equity_curve(equity_curve: List[Tuple[float, float]]) -> plt.Figure:
             va="center",
             transform=ax.transAxes,
             fontsize=14,
-            color="#888",
+            color="#8b949e",
         )
-        ax.set_facecolor("#0e1117")
-        fig.patch.set_facecolor("#0e1117")
+        ax.set_facecolor("#0f1419")
+        fig.patch.set_facecolor("#0f1419")
         return fig
 
     timestamps: List[datetime.datetime] = [
@@ -206,20 +206,21 @@ def render_equity_curve(equity_curve: List[Tuple[float, float]]) -> plt.Figure:
     ]
     balances: List[float] = [b for _, b in equity_curve]
 
-    ax.plot(timestamps, balances, color="#00d4aa", linewidth=1.5)
-    ax.fill_between(timestamps, balances, alpha=0.1, color="#00d4aa")
+    ax.plot(timestamps, balances, color="#58a6ff", linewidth=1.8)
+    ax.fill_between(timestamps, balances, alpha=0.08, color="#58a6ff")
 
     # Style
-    ax.set_facecolor("#0e1117")
-    fig.patch.set_facecolor("#0e1117")
-    ax.tick_params(colors="#888")
+    ax.set_facecolor("#0f1419")
+    fig.patch.set_facecolor("#0f1419")
+    ax.tick_params(colors="#8b949e", labelsize=9)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.spines["bottom"].set_color("#333")
-    ax.spines["left"].set_color("#333")
-    ax.set_ylabel("USDC", color="#888")
-    ax.yaxis.label.set_color("#888")
+    ax.spines["bottom"].set_color("#2d3748")
+    ax.spines["left"].set_color("#2d3748")
+    ax.set_ylabel("USDC", color="#8b949e", fontsize=10)
+    ax.yaxis.label.set_color("#8b949e")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.grid(True, alpha=0.1, color="#2d3748")
     fig.autofmt_xdate()
     fig.tight_layout()
 
@@ -395,7 +396,7 @@ def _render_backtest_tab() -> None:
             if result.get("alert_no_markets"):
                 st.warning(
                     "No real Polymarket 5-min BTC markets found for the requested "
-                    "period. Use the standard backtest (Binance data) as fallback."
+                    "period. Use the standard backtest (Bybit data) as fallback."
                 )
         except Exception as e:
             st.error(f"Real backtest failed: {e}")
@@ -503,16 +504,89 @@ def main_page() -> None:
         layout="wide",
     )
 
-    # Dark mode CSS + mobile-responsive layout
+    # Clean dark theme with high-contrast text and professional styling
     st.markdown("""
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-    .stApp { background-color: #0e1117; }
-    .stMetric label { color: #888; }
-    [data-testid="stSidebar"] { background-color: #161b22; }
+    .stApp { background-color: #0f1419; color: #e7e9ea; }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        background-color: #1a1f2e;
+        border-right: 1px solid #2d3748;
+    }
+    [data-testid="stSidebar"] .stMarkdown p,
+    [data-testid="stSidebar"] .stMarkdown span,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] .stCaption { color: #c9d1d9 !important; }
+
+    /* Metric cards */
+    [data-testid="stMetric"] {
+        background: linear-gradient(135deg, #161b2e, #1c2333);
+        border: 1px solid #2d3748;
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+    [data-testid="stMetric"] label { color: #8b949e !important; font-size: 0.85rem; }
+    [data-testid="stMetric"] [data-testid="stMetricValue"] { color: #f0f6fc !important; font-size: 1.4rem; }
+
+    /* Headers and text */
+    h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 { color: #f0f6fc !important; }
+    .stMarkdown p, .stMarkdown span, .stCaption, .stMarkdown li { color: #c9d1d9 !important; }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid #2d3748; }
+    .stTabs [data-baseweb="tab"] {
+        color: #8b949e;
+        border-radius: 6px 6px 0 0;
+        padding: 8px 20px;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #58a6ff !important;
+        border-bottom: 2px solid #58a6ff;
+        background: transparent;
+    }
+
+    /* Buttons */
+    .stButton > button {
+        border-radius: 8px;
+        font-weight: 600;
+        transition: all 0.2s;
+    }
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #238636, #2ea043) !important;
+        border: none;
+        color: white !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background: linear-gradient(135deg, #2ea043, #3fb950) !important;
+    }
+    .stButton > button[kind="secondary"] {
+        background: #21262d !important;
+        border: 1px solid #363b42 !important;
+        color: #c9d1d9 !important;
+    }
+    .stButton > button[kind="secondary"]:hover {
+        background: #30363d !important;
+        border-color: #58a6ff !important;
+    }
+
+    /* Dataframes */
+    .stDataFrame { border-radius: 8px; overflow: hidden; }
+
+    /* Slider */
+    .stSlider label { color: #c9d1d9 !important; }
+
+    /* Dividers */
+    hr { border-color: #2d3748 !important; }
+
+    /* Alerts */
+    .stAlert { border-radius: 8px; }
+
+    /* Mobile */
     @media (max-width: 768px) {
         .stColumns > div { min-width: 45% !important; }
-        .stMetric { font-size: 0.85rem; }
+        [data-testid="stMetric"] { padding: 10px 12px; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -579,7 +653,7 @@ def main_page() -> None:
             st.metric(label="Compounding", value=compounding)
 
         # --- Strategy Health Score ---
-        health_color = "red"
+        health_bg = "#da3633"
         health_label = "UNHEALTHY"
         if state.latest_status:
             live_wr = state.latest_status.get("wins", 0) / max(
@@ -592,14 +666,15 @@ def main_page() -> None:
                 > 0.01
             )
             if live_wr >= 0.58 and bt_ok:
-                health_color, health_label = "green", "HEALTHY"
+                health_bg, health_label = "#238636", "HEALTHY"
             elif live_wr >= 0.52 or (
                 state.latest_status.get("total_trades", 0) < 50
             ):
-                health_color, health_label = "orange", "WARMING UP"
+                health_bg, health_label = "#9e6a03", "WARMING UP"
         st.markdown(
-            f'<div style="padding:8px 16px;border-radius:8px;background:{health_color};'
-            f'color:white;text-align:center;font-weight:bold;margin-bottom:12px">'
+            f'<div style="padding:10px 18px;border-radius:8px;background:{health_bg};'
+            f'color:#f0f6fc;text-align:center;font-weight:600;margin-bottom:14px;'
+            f'font-size:0.95em;letter-spacing:0.5px">'
             f"Strategy Health: {health_label}</div>",
             unsafe_allow_html=True,
         )
@@ -608,19 +683,21 @@ def main_page() -> None:
         if state.latest_status and state.latest_status.get("explosive_mode"):
             if state.latest_status.get("mm_active"):
                 st.markdown(
-                    '<div style="padding:8px 14px;border-radius:8px;'
-                    'background:linear-gradient(90deg,#ff4500,#ff6b00);'
-                    'color:white;text-align:center;font-weight:bold;margin-bottom:8px;'
-                    'font-size:1.1em">'
+                    '<div style="padding:10px 18px;border-radius:8px;'
+                    'background:linear-gradient(135deg,#238636,#2ea043);'
+                    'color:#f0f6fc;text-align:center;font-weight:600;margin-bottom:10px;'
+                    'font-size:1em;letter-spacing:0.3px;'
+                    'box-shadow:0 2px 8px rgba(46,160,67,0.3)">'
                     'Explosive Mode Active &mdash; Stoikov Spread Locked</div>',
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
-                    '<div style="padding:8px 14px;border-radius:8px;'
-                    'background:linear-gradient(90deg,#ff4500,#cc3700);'
-                    'color:white;text-align:center;font-weight:bold;margin-bottom:8px;'
-                    'font-size:1.1em">'
+                    '<div style="padding:10px 18px;border-radius:8px;'
+                    'background:linear-gradient(135deg,#1f6feb,#388bfd);'
+                    'color:#f0f6fc;text-align:center;font-weight:600;margin-bottom:10px;'
+                    'font-size:1em;letter-spacing:0.3px;'
+                    'box-shadow:0 2px 8px rgba(56,139,253,0.3)">'
                     'Explosive Mode &mdash; Stoikov Quoting | Full Kelly | 0.985 Threshold</div>',
                     unsafe_allow_html=True,
                 )
@@ -699,24 +776,33 @@ def main_page() -> None:
                 comp_fig, comp_ax = plt.subplots(figsize=(10, 3.5))
                 comp_ax.plot(
                     days, projected_balances,
-                    color="#ff4500", linewidth=2.5,
+                    color="#3fb950", linewidth=2,
                 )
                 comp_ax.fill_between(
                     days, starting, projected_balances,
-                    alpha=0.15, color="#ff4500",
+                    alpha=0.1, color="#3fb950",
                 )
                 comp_ax.axhline(
-                    y=balance, color="#00cc66", linestyle="--",
+                    y=balance, color="#58a6ff", linestyle="--",
                     alpha=0.6, label=f"Current: ${balance:,.0f}",
                 )
-                comp_ax.set_xlabel("Days")
-                comp_ax.set_ylabel("Projected Balance ($)")
+                comp_ax.set_facecolor("#0f1419")
+                comp_fig.patch.set_facecolor("#0f1419")
+                comp_ax.tick_params(colors="#8b949e", labelsize=9)
+                comp_ax.spines["top"].set_visible(False)
+                comp_ax.spines["right"].set_visible(False)
+                comp_ax.spines["bottom"].set_color("#2d3748")
+                comp_ax.spines["left"].set_color("#2d3748")
+                comp_ax.set_xlabel("Days", color="#8b949e", fontsize=10)
+                comp_ax.set_ylabel("Projected Balance ($)", color="#8b949e", fontsize=10)
                 comp_ax.set_title(
                     f"Stoikov Compounding \u2014 "
-                    f"${projected_balances[-1]:,.0f} projected at Day 30"
+                    f"${projected_balances[-1]:,.0f} projected at Day 30",
+                    color="#f0f6fc", fontsize=12,
                 )
-                comp_ax.legend()
-                comp_ax.grid(True, alpha=0.2)
+                comp_ax.legend(fontsize=9, facecolor="#161b2e", edgecolor="#2d3748", labelcolor="#c9d1d9")
+                comp_ax.grid(True, alpha=0.1, color="#2d3748")
+                comp_fig.tight_layout()
                 st.pyplot(comp_fig)
                 plt.close(comp_fig)
 
@@ -735,18 +821,23 @@ def main_page() -> None:
         if state.cycle_latencies:
             st.subheader("Cycle Latency")
             lat_fig, lat_ax = plt.subplots(figsize=(10, 2.5))
-            lat_ax.plot(state.cycle_latencies, color="#ff6b6b", linewidth=1)
+            lat_ax.plot(state.cycle_latencies, color="#bc8cff", linewidth=1.2)
             lat_ax.axhline(
-                y=80, color="#ff0000", linestyle="--", alpha=0.5, label="80ms warn"
+                y=80, color="#da3633", linestyle="--", alpha=0.6, label="80ms warn"
             )
             lat_ax.axhline(
-                y=60, color="#00d4aa", linestyle="--", alpha=0.5, label="60ms target"
+                y=60, color="#3fb950", linestyle="--", alpha=0.6, label="60ms target"
             )
-            lat_ax.set_facecolor("#0e1117")
-            lat_fig.patch.set_facecolor("#0e1117")
-            lat_ax.tick_params(colors="#888")
-            lat_ax.set_ylabel("ms", color="#888")
-            lat_ax.legend(fontsize=8)
+            lat_ax.set_facecolor("#0f1419")
+            lat_fig.patch.set_facecolor("#0f1419")
+            lat_ax.tick_params(colors="#8b949e", labelsize=9)
+            lat_ax.spines["top"].set_visible(False)
+            lat_ax.spines["right"].set_visible(False)
+            lat_ax.spines["bottom"].set_color("#2d3748")
+            lat_ax.spines["left"].set_color("#2d3748")
+            lat_ax.set_ylabel("ms", color="#8b949e", fontsize=10)
+            lat_ax.legend(fontsize=8, facecolor="#161b2e", edgecolor="#2d3748", labelcolor="#c9d1d9")
+            lat_ax.grid(True, alpha=0.1, color="#2d3748")
             lat_fig.tight_layout()
             st.pyplot(lat_fig)
             plt.close(lat_fig)

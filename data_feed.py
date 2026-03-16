@@ -2,10 +2,10 @@
 data_feed.py — Async price streaming and Polymarket market discovery.
 
 Two independent producers feed shared asyncio.Queue instances:
-1. BinanceWebSocket — sub-20ms BTC/USDT perpetual ticks via ccxt.pro
+1. BybitWebSocket — sub-20ms BTC/USDT perpetual ticks via ccxt.pro
 2. GammaMarketFinder — discovers active 5-minute BTC Up/Down token IDs
 
-The winning edge starts here: low-latency Binance price data lets us detect
+The winning edge starts here: low-latency Bybit price data lets us detect
 momentum shifts before they're reflected in Polymarket CLOB prices. The
 deterministic slug generation for Gamma API eliminates discovery lag.
 """
@@ -23,7 +23,7 @@ import ccxt.pro as ccxtpro
 
 @dataclass
 class PriceTick:
-    """Single price observation from Binance perpetual stream.
+    """Single price observation from Bybit perpetual stream.
 
     Fields capture the full L1 snapshot needed for model updates:
     - last_price: most recent trade price (primary signal)
@@ -59,8 +59,8 @@ class MarketWindow:
     end_timestamp: float  # when window resolves (unix seconds)
 
 
-class BinanceWebSocket:
-    """Async Binance perpetual WebSocket feed via ccxt.pro.
+class BybitWebSocket:
+    """Async Bybit perpetual WebSocket feed via ccxt.pro.
 
     Subscribes to BTC/USDT:USDT perpetual swap for two reasons:
     1. Perpetual has tighter spreads and more volume than spot
@@ -71,7 +71,7 @@ class BinanceWebSocket:
     consumed by the main trading loop.
     """
 
-    # USDT-margined perpetual swap — highest liquidity BTC instrument on Binance
+    # USDT-margined perpetual swap — highest liquidity BTC instrument on Bybit
     SYMBOL: str = "BTC/USDT:USDT"
     MAX_RETRIES: int = 10
     BASE_DELAY: float = 1.0  # seconds for exponential backoff
@@ -84,24 +84,24 @@ class BinanceWebSocket:
                         Consumed by bot.py's trade loop.
         """
         self.tick_queue: asyncio.Queue = tick_queue
-        self.exchange: Optional[ccxtpro.binance] = None
+        self.exchange: Optional[ccxtpro.bybit] = None
         self._running: bool = False
-        self.logger: logging.Logger = logging.getLogger("BinanceWS")
+        self.logger: logging.Logger = logging.getLogger("BybitWS")
 
     async def connect(self) -> None:
         """Initialize the ccxt.pro exchange instance.
 
         Uses defaultType=swap to route all calls to the futures API.
-        enableRateLimit prevents hitting Binance's WebSocket message limits.
+        enableRateLimit prevents hitting Bybit's WebSocket message limits.
         """
-        self.exchange = ccxtpro.binance(
+        self.exchange = ccxtpro.bybit(
             {
                 "options": {"defaultType": "swap"},
                 "enableRateLimit": True,
             }
         )
         self._running = True
-        self.logger.info(f"Binance WS initialized for {self.SYMBOL}")
+        self.logger.info(f"Bybit WS initialized for {self.SYMBOL}")
 
     async def _watch_with_retry(self, watch_coro_factory, label: str):
         """Generic retry wrapper with exponential backoff for WS methods.
@@ -140,7 +140,7 @@ class BinanceWebSocket:
         return None
 
     async def run_ticker_loop(self) -> None:
-        """Infinite loop consuming Binance ticker WebSocket messages.
+        """Infinite loop consuming Bybit ticker WebSocket messages.
 
         Each iteration blocks on watch_ticker until a new message arrives
         (~50-200ms intervals). The PriceTick is immediately pushed to the
@@ -187,7 +187,7 @@ class BinanceWebSocket:
         self._running = False
         if self.exchange:
             await self.exchange.close()
-            self.logger.info("Binance WS closed")
+            self.logger.info("Bybit WS closed")
 
 
 class GammaMarketFinder:

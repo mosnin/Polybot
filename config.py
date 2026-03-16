@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 from web3 import Web3
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 @dataclass(frozen=True)
@@ -247,6 +247,7 @@ def load_config() -> Config:
         os.getenv("ORDERFLOW_IMBALANCE_THRESHOLD", "0.20")
     )
     stoikov_gamma: float = float(os.getenv("STOIKOV_GAMMA", "0.15"))
+    starting_capital: float = float(os.getenv("STARTING_CAPITAL", "100.0"))
 
     return Config(
         private_key=private_key,
@@ -264,4 +265,5 @@ def load_config() -> Config:
         mm_batch_size=mm_batch_size,
         orderflow_imbalance_threshold=orderflow_imbalance_threshold,
         stoikov_gamma=stoikov_gamma,
+        starting_capital=starting_capital,
     )

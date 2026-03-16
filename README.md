@@ -1,66 +1,148 @@
 # Polybot — BTC 5-Minute Binary Options Trading Bot
 
-Automated trading bot for Polymarket's 5-minute BTC Up/Down binary markets. Uses Bayesian inference on sub-20ms Binance perpetual ticks, Monte Carlo validation, and Kelly criterion sizing to exploit the 1-3 second information gap between centralized exchange prices and Polymarket CLOB pricing.
+Automated trading bot for Polymarket's 5-minute BTC Up/Down binary markets. Uses Bayesian inference on sub-20ms Bybit perpetual ticks, Monte Carlo validation, and Kelly criterion sizing to exploit the 1-3 second information gap between centralized exchange prices and Polymarket CLOB pricing.
 
-## Quick Start (DigitalOcean NYC3)
+---
 
-### 1. Create Droplet
+## Step-by-Step Deployment on DigitalOcean
 
-- Log in to [DigitalOcean](https://cloud.digitalocean.com)
-- **Create** → **Droplets**
-- Image: **Ubuntu 22.04 LTS**
-- Plan: **Basic $6/mo** (1 vCPU, 1GB RAM — sufficient for the bot)
-- Region: **NYC3** (critical — lowest latency to Polygon RPC and Polymarket)
-- Authentication: SSH key or password
-- Click **Create Droplet**
+### Prerequisites
 
-### 2. Run Setup
+Before you begin, you need:
 
-Open the **DigitalOcean browser console** (or SSH in) and run:
+1. **A DigitalOcean account** — Sign up at [digitalocean.com](https://www.digitalocean.com) (they often have $200 free credit for new users)
+2. **A Polygon wallet private key** — Export from MetaMask: Settings → Security → Reveal Private Key
+3. **An Alchemy API key** — Free at [dashboard.alchemy.com](https://dashboard.alchemy.com) (select Polygon network)
+4. **USDC on Polygon** — Bridge from Ethereum or buy directly on Polygon. Minimum $100 recommended.
+
+---
+
+### Step 1: Create a DigitalOcean Droplet
+
+1. Log in to [cloud.digitalocean.com](https://cloud.digitalocean.com)
+2. Click the green **Create** button in the top right → **Droplets**
+3. Configure your droplet:
+
+   | Setting | Value | Why |
+   |---------|-------|-----|
+   | **Region** | **New York — NYC3** | Lowest latency to Polygon RPC and Polymarket servers |
+   | **Image** | **Ubuntu 22.04 (LTS) x64** | Stable, well-supported |
+   | **Size** | **Basic — $6/mo** (1 vCPU, 1 GB RAM, 25 GB SSD) | More than enough for the bot |
+   | **Authentication** | **Password** (simplest) or **SSH Key** (more secure) | Your choice |
+   | **Hostname** | `polybot` (or anything you like) | Just a label |
+
+4. Click **Create Droplet** and wait ~60 seconds for it to spin up
+5. Copy the **IP address** shown on the droplet page — you'll need it
+
+---
+
+### Step 2: Connect to Your Droplet
+
+**Option A — DigitalOcean Browser Console (easiest, no software needed):**
+1. Click on your droplet name
+2. Click **Console** in the top right
+3. A terminal opens in your browser — you're logged in as root
+
+**Option B — SSH from your computer:**
+```bash
+ssh root@YOUR_DROPLET_IP
+```
+
+---
+
+### Step 3: Upload the Bot Code
+
+If the code isn't already on the server, upload it:
+
+```bash
+# From your LOCAL computer (not the droplet):
+scp -r /path/to/Polybot root@YOUR_DROPLET_IP:/home/user/
+```
+
+Or clone from your repository:
+```bash
+cd /home/user
+git clone YOUR_REPO_URL Polybot
+```
+
+---
+
+### Step 4: Configure Your .env File
 
 ```bash
 cd /home/user/Polybot
-nano .env   # paste your real keys (see .env.example)
+cp .env.example .env
+nano .env
+```
+
+Edit these two required fields — replace the placeholder text with your actual keys:
+
+```
+POLYGON_PRIVATE_KEY=0xYourActualPrivateKeyHere
+ALCHEMY_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YourActualApiKey
+```
+
+Optional but recommended settings:
+```
+STARTING_CAPITAL=100          # Your initial USDC deposit amount
+TEST_MODE=true                # Keep true until backtest passes
+ENABLE_DASHBOARD=true         # Web dashboard on port 8501
+REDIS_URL=redis://localhost:6379/0   # State persistence across restarts
+```
+
+Save: press `Ctrl+X`, then `Y`, then `Enter`.
+
+Lock down file permissions:
+```bash
+chmod 600 .env
+```
+
+---
+
+### Step 5: Run the Setup Script
+
+```bash
 chmod +x setup.sh
 sudo ./setup.sh
 ```
 
-`setup.sh` installs Python 3.11, supervisor, Redis, Caddy, all pip dependencies, runs the one-time USDC approval, and starts the bot under supervisor.
+This takes 2-3 minutes and automatically:
+- Installs Python 3.11, Redis, Caddy, Supervisor
+- Creates a virtual environment with all dependencies
+- Validates your .env configuration
+- Runs the one-time USDC approval (costs ~$0.01 gas)
+- Starts the bot under Supervisor (auto-restarts on crash)
 
-If `.env` is missing, setup.sh copies the template and exits with instructions. Fill in your keys and re-run.
+If setup fails on the .env step, edit your .env file and re-run `sudo ./setup.sh`.
 
-### 3. Fund Your Wallet
+---
 
-Setup prints your Polygon wallet address. Send USDC to it:
+### Step 6: Fund Your Wallet
 
-- Network: **Polygon** (not Ethereum mainnet)
-- Token: **USDC** (bridged USDC.e)
-- Amount: **Any amount** — the bot works with whatever you deposit
-- Minimum recommended: $100 (matches the `safety_floor_usdc` setting)
+The setup script prints your Polygon wallet address. Send USDC to it:
 
-Every chart, metric, risk calculation, position size, and withdrawal limit in the system dynamically reflects your real on-chain balance at all times. There are no hardcoded amounts anywhere.
+- **Network**: Polygon (NOT Ethereum mainnet — you'll lose funds)
+- **Token**: USDC (bridged USDC.e on Polygon)
+- **Amount**: Minimum $100 recommended
 
-### 4. USDC Approval
+You can also find your wallet address anytime:
+```bash
+cd /home/user/Polybot
+venv/bin/python -c "from eth_account import Account; from dotenv import load_dotenv; import os; load_dotenv(); print(Account.from_key(os.getenv('POLYGON_PRIVATE_KEY')).address)"
+```
 
-`setup.sh` runs this automatically. If it failed, run manually:
+---
+
+### Step 7: Run a Backtest First
+
+Before risking real money, validate the strategy on historical data:
 
 ```bash
 cd /home/user/Polybot
-venv/bin/python approve_usdc.py
-```
-
-One-time operation. Approves both Polymarket exchange contracts. Costs ~$0.01 gas.
-
-### 5. Backtest First
-
-Before going live, validate the edge on historical data:
-
-```bash
 venv/bin/python backtest.py
-venv/bin/python backtest.py --windows 2000  # higher confidence
 ```
 
-This replays 1000+ historical 5-minute windows through the exact same model pipeline. Look for:
+This downloads 30 days of 1-second BTC ticks and replays ~8,600 five-minute windows through the full pipeline. Look for:
 
 | Metric | Go-Live Threshold |
 |--------|-------------------|
@@ -69,59 +151,100 @@ This replays 1000+ historical 5-minute windows through the exact same model pipe
 | Sharpe Ratio | > 1.0 |
 | Max Drawdown | < 15% |
 
-Only set `TEST_MODE=false` after the backtest confirms positive edge.
+Only proceed to live trading after confirming positive edge.
 
-### 6. Start Trading
+---
 
-The bot starts automatically via supervisor after `setup.sh`. Check status:
+### Step 8: Go Live
 
-```bash
-supervisorctl status polybot        # should show RUNNING
-tail -f /var/log/polybot/bot.log    # live trading logs
-supervisorctl restart polybot       # restart after config changes
-```
-
-To switch from test mode to live:
+Switch from test mode to live trading:
 
 ```bash
-nano .env                           # set TEST_MODE=false
-supervisorctl restart polybot       # restart picks up new config
+cd /home/user/Polybot
+nano .env
+# Change: TEST_MODE=false
+# Save: Ctrl+X → Y → Enter
+
+supervisorctl restart polybot
 ```
 
-### 7. Dashboard Access
-
-**Local network:**
-```
-http://<droplet-ip>:8501
-```
-
-**Remote (phone/laptop) via ngrok:**
+Check that the bot is running:
 ```bash
-export NGROK_AUTHTOKEN=your_token   # get free at ngrok.com
+supervisorctl status polybot         # Should show RUNNING
+tail -f /var/log/polybot/bot.log     # Live trading logs
+```
+
+---
+
+### Step 9: Access the Dashboard
+
+**From any browser on your network:**
+```
+http://YOUR_DROPLET_IP:8501
+```
+
+**From your phone or laptop anywhere (via ngrok):**
+```bash
+cd /home/user/Polybot
+export NGROK_AUTHTOKEN=your_token    # Free at ngrok.com
 venv/bin/python ngrok_integration.py
 ```
+This prints a public HTTPS URL you can open on any device.
 
-Prints a public HTTPS URL accessible from any device.
+**With a custom domain (automatic HTTPS via Caddy):**
 
-**With custom domain (Caddy):**
-
-Add to `/etc/caddy/Caddyfile`:
+Edit `/etc/caddy/Caddyfile`:
 ```
 your-domain.com {
     reverse_proxy localhost:8501
 }
 ```
-Then `systemctl restart caddy`. Caddy auto-provisions TLS via Let's Encrypt.
+Then restart Caddy:
+```bash
+systemctl restart caddy
+```
+Point your domain's DNS A record to your droplet's IP. Caddy auto-provisions Let's Encrypt TLS.
+
+---
+
+## Daily Operations
+
+### Common Commands
+
+```bash
+supervisorctl status polybot          # Check bot status
+supervisorctl restart polybot         # Restart (picks up .env changes)
+supervisorctl stop polybot            # Stop trading
+tail -f /var/log/polybot/bot.log      # Watch live logs
+tail -100 /var/log/polybot/bot.log    # Last 100 log lines
+```
+
+### Updating Configuration
+
+1. Edit `.env` with `nano /home/user/Polybot/.env`
+2. Restart: `supervisorctl restart polybot`
+
+The bot reloads all settings from `.env` on restart. No code changes needed.
+
+### Withdrawing Profits
+
+Use the dashboard sidebar **Withdraw** section, or run:
+```bash
+cd /home/user/Polybot
+venv/bin/python withdraw.py
+```
+
+---
 
 ## Architecture
 
 Five concurrent async coroutines in a single process:
 
 ```
-Binance WebSocket → tick_queue → BayesianModel → Signal → OrderExecutor → CLOB
-     ↑                                ↑                        ↑
-  ccxt.pro                    Monte Carlo (1000 GBM)     Maker limit orders
-  BTC/USDT:USDT               + Kelly criterion          midpoint - 0.01
+Bybit WebSocket → tick_queue → BayesianModel → Signal → OrderExecutor → CLOB
+     ↑                              ↑                        ↑
+  ccxt.pro                  Monte Carlo (1000 GBM)     Maker limit orders
+  BTC/USDT:USDT              + Kelly criterion          midpoint - 0.01
 
 GammaMarketFinder → market_queue → model.reset()
                                    (new 5-min window)
@@ -133,7 +256,7 @@ Target: **tick-to-order-decision in under 80ms** on a standard VPS.
 
 ## Live Balance — Everything is Dynamic
 
-Every display, calculation, and decision in the system uses the **real USDC balance from your Polygon wallet**, fetched live via web3 on every tick cycle:
+Every display, calculation, and decision uses the **real USDC balance from your Polygon wallet**, fetched live via web3:
 
 - **Dashboard balance card**: live from `executor.get_current_balance()`
 - **Equity curve chart**: every point is a live balance snapshot
@@ -143,59 +266,13 @@ Every display, calculation, and decision in the system uses the **real USDC bala
 - **Compounding gate**: scales with live balance after activation
 - **Risk slider**: exposure percentage applied to live balance
 
-`config.starting_capital` ($100) is only a fallback if the very first RPC call fails on startup. It is never used in steady-state operation.
-
-## Key Features
-
-### Auto-Compounding
-
-Position sizes are gated until the bot proves its edge:
-
-1. **First 200 trades**: sizes capped to `starting_capital` (conservative)
-2. **After 200 trades**: activates only if ALL three conditions are met:
-   - Win rate > 50%
-   - Average daily return > 1%
-   - Sufficient equity history for calculation
-3. **After activation**: Kelly sizes scale with full live balance — profits compound
-
-### Dynamic Z-Score (Liquidity-Aware)
-
-The z-score (edge confidence metric) adjusts based on real-time CLOB order book depth:
-
-- **Thin order book** (< 500 tokens): z-score scaled down by 1.5x → higher bar to trade
-- **Thick order book** (> 5000 tokens): z-score scaled up by 0.8x → edge more reliable
-- **Unavailable**: defaults to 1.0x (no adjustment)
-
-This prevents false signals in illiquid markets where small orders move the midpoint.
-
-### Batch Orders (Low Volatility)
-
-When per-tick volatility drops below `low_vol_threshold` (0.05%), the bot splits orders across 3 price levels:
-
-| Level | Price | Purpose |
-|-------|-------|---------|
-| L0 | midpoint - $0.01 | Best fill probability |
-| L1 | midpoint - $0.02 | Better price, moderate fill |
-| L2 | midpoint - $0.03 | Best price for us, lowest fill |
-
-Total position size is identical to a single order — it's just distributed. This maximizes maker rebate capture during calm markets.
-
-### Redis State Persistence
-
-Bayesian model state (alpha, beta, price history, tick count) is persisted to Redis on every tick update. On restart, the model resumes from saved state instead of starting from an uninformative prior. This preserves winning edge continuity across deployments.
-
-Set in `.env`:
-```
-REDIS_URL=redis://localhost:6379/0
-```
-
 ## Configuration
 
-All settings are in `config.py` (frozen dataclass) with secrets in `.env`:
+All settings are in `config.py` with secrets in `.env`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `starting_capital` | $100 | Fallback only — live balance is always used |
+| `starting_capital` | $100 | Fallback for projections — live balance is always used |
 | `min_exposure_pct` | 5% | Floor for position size as % of balance |
 | `max_exposure_pct` | 10% | Cap for position size (adjustable via dashboard) |
 | `min_edge_threshold` | 2% | Minimum net edge after fees to trade |
@@ -203,64 +280,67 @@ All settings are in `config.py` (frozen dataclass) with secrets in `.env`:
 | `drawdown_hard_stop_pct` | 25% | Halt if drawdown from peak exceeds this |
 | `max_consecutive_losses` | 5 | Skip window after this many losses in a row |
 | `round_trip_cost_pct` | 0.3% | Worst-case fee assumption (maker is lower) |
-| `low_vol_threshold` | 0.0005 | Per-tick vol below which batch orders activate |
 | `mc_paths` | 1000 | Monte Carlo simulation paths |
 
 ## Troubleshooting
 
+### Bot Won't Start
+
+```bash
+# Check supervisor logs for error messages
+supervisorctl tail polybot stderr
+
+# Validate .env is configured correctly
+cat .env | head -5
+
+# Test config loading
+cd /home/user/Polybot
+venv/bin/python -c "from config import load_config; c = load_config(); print(f'Config OK: chain_id={c.chain_id}')"
+
+# Check Python version
+venv/bin/python --version   # Should be 3.11.x
+
+# Check Redis
+systemctl status redis-server
+redis-cli ping              # Should return PONG
+```
+
+### .env Changes Not Taking Effect
+
+The bot only reads `.env` at startup. After editing:
+```bash
+supervisorctl restart polybot
+```
+
+Make sure you're editing the right file (`/home/user/Polybot/.env`, not `.env.example`).
+
 ### Latency > 80ms
 
-1. **Verify NYC3 region**: Polygon validators and Alchemy infrastructure are concentrated on the US East Coast. NYC3 gives sub-30ms RPC latency.
+1. Verify NYC3 region — check RPC latency:
    ```bash
    curl -w "time_total: %{time_total}s\n" -o /dev/null -s \
      -X POST -H "Content-Type: application/json" \
      -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
      $ALCHEMY_RPC_URL
    ```
-   Should show < 0.03s. If > 0.05s, check your Alchemy plan or region.
+   Should show < 0.03s.
 
-2. **Check Redis**: `redis-cli ping` should return `PONG`. If Redis is down, model persistence adds 0ms overhead (fails silently), but check if something else is wrong.
+2. Check system load: `htop` — bot should use < 20% CPU.
 
-3. **Reduce MC paths**: Set `mc_paths: int = 500` in `config.py` — saves ~2ms per evaluation. Still statistically valid for edge detection.
-
-4. **Check system load**: `htop` — the bot should use < 20% CPU. If higher, check for runaway processes.
-
-### Drawdown Recovery
-
-The bot auto-halts at 25% drawdown from peak balance. To recover:
-
-1. **Check logs**: `tail -100 /var/log/polybot/bot.log | grep -i "drawdown\|halt\|error"`
-2. **Run backtest on recent data**: `venv/bin/python backtest.py --days 1` — does the edge still hold?
-3. **If temporary dip**: Resume via dashboard "Resume Trading" button, or restart:
-   ```bash
-   supervisorctl restart polybot
-   ```
-4. **If persistent**: The market regime may have changed. Keep the bot paused and monitor.
-
-### Bot Won't Start
-
-```bash
-# Check supervisor logs
-supervisorctl tail polybot stderr
-
-# Validate .env
-cat .env | head -5
-
-# Test config loading
-venv/bin/python -c "from config import load_config; c = load_config(); print(f'Config OK: {c.chain_id}')"
-
-# Check Redis
-systemctl status redis-server
-
-# Check Python venv
-venv/bin/python --version  # should be 3.11.x
-```
+3. Reduce MC paths: set `mc_paths` to 500 in config.py (saves ~2ms).
 
 ### Connection Issues
 
-- **Binance WebSocket disconnects**: The bot auto-reconnects with exponential backoff (up to 10 retries). Check logs for `WebSocket` entries.
-- **CLOB API errors**: Usually transient. The bot skips the tick and retries on the next cycle.
-- **Alchemy RPC rate limits**: Free tier allows 300 req/s. If hitting limits, upgrade to Growth plan.
+- **Bybit WebSocket disconnects**: Auto-reconnects with exponential backoff (up to 10 retries). Check logs for `BybitWS` entries.
+- **CLOB API errors**: Usually transient. Bot skips the tick and retries next cycle.
+- **Alchemy RPC rate limits**: Free tier allows 300 req/s. Upgrade if hitting limits.
+
+### Drawdown Recovery
+
+The bot auto-halts at 25% drawdown from peak. To recover:
+1. Check logs: `tail -100 /var/log/polybot/bot.log | grep -i "drawdown\|halt"`
+2. Run a quick backtest: `venv/bin/python backtest.py --days 1`
+3. Resume via dashboard or restart: `supervisorctl restart polybot`
 
 ## File Structure
 
@@ -269,12 +349,13 @@ Polybot/
 ├── bot.py                 # Main orchestrator — 5 async coroutines
 ├── model.py               # Bayesian inference + Monte Carlo + Kelly
 ├── executor.py            # CLOB order execution (maker limits, batch orders)
-├── data_feed.py           # Binance WebSocket + Gamma market discovery
+├── data_feed.py           # Bybit WebSocket + Gamma market discovery
 ├── config.py              # Frozen dataclass configuration
 ├── dashboard.py           # Streamlit real-time dashboard (port 8501)
 ├── backtest.py            # Historical backtesting (standalone)
 ├── approve_usdc.py        # One-time USDC approval for exchange contracts
 ├── withdraw.py            # USDC withdrawal from Polygon wallet
+├── performance.py         # Decay weights, adaptive z-score, rebate optimizer
 ├── ngrok_integration.py   # HTTPS tunnel for remote dashboard access
 ├── setup.sh               # DigitalOcean VPS deployment script
 ├── supervisor.conf        # Process management configuration
@@ -283,70 +364,12 @@ Polybot/
 └── README.md              # This file
 ```
 
-## How to Audit & Tune
-
-### Re-run Deep Backtest (30 days)
-
-```bash
-cd /home/user/Polybot
-venv/bin/python backtest.py
-```
-
-Downloads 30 days of 1-second BTC ticks, replays ~8,600 windows. Look for:
-- Win rate >= 58%
-- Daily expectancy >= 0.8%
-- Sharpe > 1.0
-- Max drawdown < 25%
-
-Or use the dashboard: **Backtest tab → Run Backtest** button.
-
-### Performance Latency Check
-
-```bash
-tail -f /var/log/polybot/bot.log | grep -i "latency\|slow cycle"
-```
-
-Target: <60ms average cycle. If consistently >80ms, see Troubleshooting.
-
-### Verify Contract Addresses
-
-```bash
-venv/bin/python -c "from config import load_config; load_config(); print('Checksum validation passed')"
-```
-
-This validates all 4 Polymarket contract addresses against EIP-55 checksums.
-
-### Check .env Security
-
-```bash
-ls -la .env  # should show -rw------- (600 permissions)
-chmod 600 .env  # fix if needed
-```
-
-### Tune Model Parameters
-
-Key tuning knobs in `config.py`:
-
-| Parameter | Effect of increasing | Effect of decreasing |
-|-----------|---------------------|---------------------|
-| `min_edge_threshold` | Fewer trades, higher quality | More trades, noisier |
-| `decay_factor` | More weight on recent ticks | Smoother, slower adaptation |
-| `mc_paths` | More accurate MC, +2ms latency | Faster, slightly noisier |
-| `low_vol_threshold` | More batch orders | More single orders |
-| `rebate_depth_threshold` | Rebate mode triggers less often | Triggers more often |
-
-### Monitor Alerts
-
-If SMTP is configured in `.env`, the bot auto-emails on:
-- Drawdown exceeds 15% (early warning before 25% hard stop)
-- Average cycle latency exceeds 80ms for 50+ cycles
-- 3 consecutive API failures (circuit breaker activation)
-
 ## Security
 
 - **Zero custody**: Your private key never leaves the VPS. All signing is local via web3.py.
 - **No external key storage**: Keys are in `.env` on your server only.
 - **.env is gitignored**: Never committed to version control.
+- **File permissions**: `chmod 600 .env` prevents other users from reading your keys.
 - **Supervisor isolation**: Bot runs as a managed process, not a background shell job.
 
 ## License

@@ -2,13 +2,13 @@
 bot.py — Main orchestrator for the Polymarket BTC 5-minute trading bot.
 
 Ties together all components into a single async runtime:
-- BinanceWebSocket → price ticks → BayesianModel → Signal → OrderExecutor
+- BybitWebSocket → price ticks → BayesianModel → Signal → OrderExecutor
 - GammaMarketFinder → market windows → model reset + token selection
 - Safety controls: drawdown hard stop, streak pause, compounding gate
 - Rich console logging with real-time performance metrics
 
 The architecture runs 5 concurrent coroutines via asyncio.gather:
-1. Binance ticker loop (producer: price ticks)
+1. Bybit ticker loop (producer: price ticks)
 2. Gamma market finder (producer: market windows)
 3. Market discovery consumer (resets model per window)
 4. Stale order canceller (maintenance: frees locked capital)
@@ -41,7 +41,7 @@ from rich.console import Console
 from rich.table import Table
 
 from config import Config, load_config
-from data_feed import BinanceWebSocket, GammaMarketFinder, MarketWindow, PriceTick
+from data_feed import BybitWebSocket, GammaMarketFinder, MarketWindow, PriceTick
 from executor import OrderExecutor, OrderResult
 from model import BayesianModel, Signal
 from performance import LatencyMonitor, adaptive_z_score, rebate_optimizer
@@ -84,7 +84,7 @@ class AsyncBot:
     """Main bot class orchestrating all components.
 
     The bot's positive expectancy comes from three compounding edges:
-    1. Information edge: Binance perpetual ticks lead Polymarket CLOB by 1-3s
+    1. Information edge: Bybit perpetual ticks lead Polymarket CLOB by 1-3s
     2. Statistical edge: Bayesian + MC filters noise, only trades strong signals
     3. Execution edge: Maker limit orders capture rebates, reducing effective cost
 
@@ -124,7 +124,7 @@ class AsyncBot:
         self.market_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
 
         # Component initialization
-        self.binance: BinanceWebSocket = BinanceWebSocket(self.tick_queue)
+        self.bybit: BybitWebSocket = BybitWebSocket(self.tick_queue)
         self.gamma: GammaMarketFinder = GammaMarketFinder(self.market_queue)
         self.model: BayesianModel = BayesianModel(
             min_edge=config.min_edge_threshold,
@@ -916,7 +916,7 @@ class AsyncBot:
     async def _trade_loop(self) -> None:
         """Main tick-to-decision pipeline. The core trading loop.
 
-        For each tick from Binance WebSocket:
+        For each tick from Bybit WebSocket:
         1. Update Bayesian model with new price observation
         2. Check if active market exists with sufficient time remaining
         3. Run safety checks (drawdown, streak)
@@ -947,7 +947,7 @@ class AsyncBot:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Block until next tick arrives from Binance
+            # Block until next tick arrives from Bybit
             tick: PriceTick = await self.tick_queue.get()
 
             # Step 1: Update Bayesian model with new price evidence
@@ -1258,7 +1258,7 @@ class AsyncBot:
         """Main entry point — launches all concurrent async tasks.
 
         The 5 coroutines run indefinitely via asyncio.gather:
-        - 2 producers (Binance ticks, Gamma markets)
+        - 2 producers (Bybit ticks, Gamma markets)
         - 3 consumers (market discovery, stale order cleanup, trade loop)
 
         KeyboardInterrupt (Ctrl+C) triggers graceful shutdown:
@@ -1285,13 +1285,13 @@ class AsyncBot:
         self.state.peak_balance = self.state.current_balance
         self.logger.info(f"Starting balance: ${self.state.current_balance:.2f}")
 
-        # Connect Binance WebSocket
-        await self.binance.connect()
+        # Connect Bybit WebSocket
+        await self.bybit.connect()
 
         try:
             # Launch all 5 concurrent tasks
             await asyncio.gather(
-                self.binance.run_ticker_loop(),  # Producer: Binance price ticks
+                self.bybit.run_ticker_loop(),  # Producer: Bybit price ticks
                 self.gamma.run(),  # Producer: Polymarket market windows
                 self._market_discovery_loop(),  # Consumer: update current market
                 self._stale_order_loop(),  # Maintenance: cancel stale orders
@@ -1304,7 +1304,7 @@ class AsyncBot:
         finally:
             # Graceful shutdown: clean up all resources
             self.logger.info("Shutting down...")
-            await self.binance.close()
+            await self.bybit.close()
             await self.gamma.close()
             self.executor.cancel_all()
 
@@ -1327,7 +1327,7 @@ async def main() -> None:
     If ENABLE_DASHBOARD=true in .env, launches a Streamlit dashboard
     in a separate process connected via multiprocessing queues.
     """
-    load_dotenv()
+    load_dotenv(override=True)
 
     # Configure logging with timestamps for latency analysis
     logging.basicConfig(

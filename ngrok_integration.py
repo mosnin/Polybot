@@ -51,19 +51,30 @@ def main() -> None:
         error_msg: str = str(e).lower()
         if "auth" in error_msg or "token" in error_msg:
             print()
-            print("ERROR: ngrok authentication failed.")
+            print("  WARNING: ngrok authentication failed.")
             print()
-            print("  1. Get a free auth token at:")
+            print("  The dashboard is still accessible on your local network:")
+            print("  http://<your-server-ip>:8501")
+            print()
+            print("  To enable remote HTTPS access:")
+            print("  1. Sign up and verify your account at:")
             print("     https://dashboard.ngrok.com/get-started/your-authtoken")
-            print()
-            print("  2. Set it in your environment:")
+            print("  2. Set your auth token:")
             print("     export NGROK_AUTHTOKEN=your_token_here")
-            print()
-            print("  3. Or add to .env:")
-            print("     NGROK_AUTHTOKEN=your_token_here")
+            print("  3. Re-run this script")
         else:
-            print(f"\nERROR: ngrok connection failed: {e}")
-        sys.exit(1)
+            print(f"\n  WARNING: ngrok connection failed: {e}")
+
+        print()
+        print("  Falling back to local-only dashboard access.")
+        print("  Press Ctrl+C to exit.")
+        print()
+
+        # Stay alive so the user sees the message (don't hard-exit)
+        signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+        signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+        while True:
+            time.sleep(60)
 
     public_url: str = tunnel.public_url
 

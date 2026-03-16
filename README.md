@@ -56,13 +56,13 @@ If the code isn't already on the server, upload it:
 
 ```bash
 # From your LOCAL computer (not the droplet):
-scp -r /path/to/Polybot root@YOUR_DROPLET_IP:/home/user/
+scp -r /path/to/Polybot root@YOUR_DROPLET_IP:/root/Polybot
 ```
 
 Or clone from your repository:
 ```bash
-cd /home/user
-git clone YOUR_REPO_URL Polybot
+cd /root
+git clone YOUR_REPO_URL polybot
 ```
 
 ---
@@ -70,16 +70,41 @@ git clone YOUR_REPO_URL Polybot
 ### Step 4: Configure Your .env File
 
 ```bash
-cd /home/user/Polybot
+cd /root/Polybot
 cp .env.example .env
-nano .env
 ```
 
-Edit these two required fields — replace the placeholder text with your actual keys:
+**Recommended method (paste-friendly, works in DO browser console):**
 
-```
+```bash
+cat > .env << 'EOF'
 POLYGON_PRIVATE_KEY=0xYourActualPrivateKeyHere
 ALCHEMY_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YourActualApiKey
+STARTING_CAPITAL=100
+TEST_MODE=true
+ENABLE_DASHBOARD=true
+REDIS_URL=redis://localhost:6379/0
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASS=
+ALERT_EMAIL=
+NGROK_AUTHTOKEN=
+EOF
+```
+
+Replace the two placeholder values with your actual keys, then paste the whole block into the terminal and press Enter.
+
+> **Why not nano?** The DigitalOcean browser console often freezes with interactive editors (nano, vi). The `cat` heredoc method above pastes directly — no editor needed. If you prefer nano and it works for you, `nano .env` is fine too.
+
+Verify your keys saved correctly:
+```bash
+cat .env | head -2
+```
+
+Lock down permissions:
+```bash
+chmod 600 .env
 ```
 
 Optional but recommended settings:
@@ -127,7 +152,7 @@ The setup script prints your Polygon wallet address. Send USDC to it:
 
 You can also find your wallet address anytime:
 ```bash
-cd /home/user/Polybot
+cd /root/Polybot
 venv/bin/python -c "from eth_account import Account; from dotenv import load_dotenv; import os; load_dotenv(); print(Account.from_key(os.getenv('POLYGON_PRIVATE_KEY')).address)"
 ```
 
@@ -138,7 +163,7 @@ venv/bin/python -c "from eth_account import Account; from dotenv import load_dot
 Before risking real money, validate the strategy on historical data:
 
 ```bash
-cd /home/user/Polybot
+cd /root/Polybot
 venv/bin/python backtest.py
 ```
 
@@ -160,7 +185,7 @@ Only proceed to live trading after confirming positive edge.
 Switch from test mode to live trading:
 
 ```bash
-cd /home/user/Polybot
+cd /root/Polybot
 nano .env
 # Change: TEST_MODE=false
 # Save: Ctrl+X → Y → Enter
@@ -185,7 +210,7 @@ http://YOUR_DROPLET_IP:8501
 
 **From your phone or laptop anywhere (via ngrok):**
 ```bash
-cd /home/user/Polybot
+cd /root/Polybot
 export NGROK_AUTHTOKEN=your_token    # Free at ngrok.com
 venv/bin/python ngrok_integration.py
 ```
@@ -221,7 +246,7 @@ tail -100 /var/log/polybot/bot.log    # Last 100 log lines
 
 ### Updating Configuration
 
-1. Edit `.env` with `nano /home/user/Polybot/.env`
+1. Edit `.env` with `nano /root/Polybot/.env`
 2. Restart: `supervisorctl restart polybot`
 
 The bot reloads all settings from `.env` on restart. No code changes needed.
@@ -230,7 +255,7 @@ The bot reloads all settings from `.env` on restart. No code changes needed.
 
 Use the dashboard sidebar **Withdraw** section, or run:
 ```bash
-cd /home/user/Polybot
+cd /root/Polybot
 venv/bin/python withdraw.py
 ```
 
@@ -294,7 +319,7 @@ supervisorctl tail polybot stderr
 cat .env | head -5
 
 # Test config loading
-cd /home/user/Polybot
+cd /root/Polybot
 venv/bin/python -c "from config import load_config; c = load_config(); print(f'Config OK: chain_id={c.chain_id}')"
 
 # Check Python version
@@ -312,7 +337,7 @@ The bot only reads `.env` at startup. After editing:
 supervisorctl restart polybot
 ```
 
-Make sure you're editing the right file (`/home/user/Polybot/.env`, not `.env.example`).
+Make sure you're editing the right file (`/root/Polybot/.env`, not `.env.example`).
 
 ### Latency > 80ms
 

@@ -568,18 +568,23 @@ class BayesianModel:
         no_midpoint: float,
         spread_threshold: float = 0.985,
         batch_size: int = 5,
+        stoikov_yes: Optional[dict] = None,
+        stoikov_no: Optional[dict] = None,
     ) -> Optional[dict]:
         """Check if YES + NO midpoints create a market-making spread.
 
         When the sum of midpoints < threshold, buying both sides locks in
         guaranteed value (1.00 payout on one side, minus cost of both).
-        Generates staggered batch price levels for aggressive fill probability.
+        If Stoikov reservation prices are provided, batch levels are anchored
+        at the optimal_bid from each side's Stoikov calculation.
 
         Args:
             yes_midpoint: Current CLOB midpoint for YES token (0.0–1.0)
             no_midpoint: Current CLOB midpoint for NO token (0.0–1.0)
             spread_threshold: Trigger when sum < this (default 0.985)
             batch_size: Number of price levels per side (default 5)
+            stoikov_yes: Optional Stoikov dict for YES side (from compute_stoikov)
+            stoikov_no: Optional Stoikov dict for NO side (from compute_stoikov)
 
         Returns:
             Dict with spread metrics + batch_levels if opportunity found, None otherwise.
@@ -590,9 +595,15 @@ class BayesianModel:
 
         spread: float = 1.0 - mid_sum
 
-        # Best price: one tick below midpoint (maker side)
-        yes_price: float = round(yes_midpoint - 0.01, 2)
-        no_price: float = round(no_midpoint - 0.01, 2)
+        # Best price: Stoikov optimal_bid if available, else naive midpoint - 0.01
+        if stoikov_yes is not None:
+            yes_price: float = stoikov_yes["optimal_bid"]
+        else:
+            yes_price = round(yes_midpoint - 0.01, 2)
+        if stoikov_no is not None:
+            no_price: float = stoikov_no["optimal_bid"]
+        else:
+            no_price = round(no_midpoint - 0.01, 2)
 
         # Clamp to valid range
         yes_price = max(0.01, min(0.99, yes_price))
@@ -605,12 +616,14 @@ class BayesianModel:
         if expected_profit <= 0:
             return None  # spread doesn't cover costs
 
-        # Generate staggered batch levels (0.005 apart below midpoint)
+        # Generate staggered batch levels anchored at Stoikov optimal_bid
+        yes_anchor: float = yes_price
+        no_anchor: float = no_price
         yes_levels: list = []
         no_levels: list = []
         for i in range(batch_size):
-            yp: float = round(yes_midpoint - 0.01 - i * 0.005, 3)
-            np_: float = round(no_midpoint - 0.01 - i * 0.005, 3)
+            yp: float = round(yes_anchor - i * 0.005, 3)
+            np_: float = round(no_anchor - i * 0.005, 3)
             yes_levels.append(max(0.01, min(0.99, yp)))
             no_levels.append(max(0.01, min(0.99, np_)))
 
@@ -668,4 +681,65 @@ class BayesianModel:
             "imbalance": round(imbalance, 4),
             "favor_side": favor_side,
             "magnitude": round(magnitude, 4),
+        }
+
+    def compute_stoikov_reservation_price(
+        self,
+        midpoint: float,
+        remaining_secs: float,
+        gamma: float = 0.15,
+    ) -> dict:
+        """Avellaneda-Stoikov reservation price for optimal market-making.
+
+        Core formula:
+            r = s - q * gamma * sigma^2 * (T - t)
+
+        Where:
+            s = current CLOB midpoint price (YES share)
+            q = Bayesian posterior centered at 0 (inventory skew)
+            gamma = risk aversion parameter (higher = tighter quotes)
+            sigma = rolling volatility (std of last 30 price ticks)
+            T - t = seconds remaining in current 5-minute window
+
+        Optimal execution prices derived from the reservation price:
+            optimal_spread = max(0.02, gamma * sigma^2 * (T-t))
+            ask = r + spread/2
+            bid = r - spread/2
+
+        Returns:
+            Dict with reservation_price, optimal_bid, optimal_ask,
+            optimal_spread, sigma, gamma, remaining_secs, inventory_skew.
+        """
+        sigma: float = self.volatility  # std of last 30 ticks
+
+        # Inventory skew: center posterior around 0 (-0.5 to +0.5)
+        # Positive q (model bullish) → lower reservation price (encourages selling)
+        # Negative q (model bearish) → higher reservation (encourages buying)
+        q: float = self.true_prob_up - 0.5
+
+        # Stoikov reservation price
+        r: float = midpoint - q * gamma * (sigma ** 2) * remaining_secs
+
+        # Optimal spread (Avellaneda-Stoikov approximation)
+        optimal_spread: float = gamma * (sigma ** 2) * remaining_secs
+        # Floor at 2 cents to ensure maker classification on CLOB
+        optimal_spread = max(0.02, optimal_spread)
+
+        optimal_ask: float = r + optimal_spread / 2
+        optimal_bid: float = r - optimal_spread / 2
+
+        # Clamp to valid CLOB range [0.01, 0.99]
+        optimal_ask = max(0.01, min(0.99, round(optimal_ask, 3)))
+        optimal_bid = max(0.01, min(0.99, round(optimal_bid, 3)))
+        r = max(0.01, min(0.99, round(r, 3)))
+
+        return {
+            "reservation_price": r,
+            "optimal_bid": optimal_bid,
+            "optimal_ask": optimal_ask,
+            "optimal_spread": round(optimal_spread, 4),
+            "sigma": round(sigma, 6),
+            "gamma": gamma,
+            "remaining_secs": remaining_secs,
+            "inventory_skew": round(q, 4),
         }

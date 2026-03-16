@@ -232,24 +232,13 @@ class OrderExecutor:
         midpoint: float,
         max_exposure_pct: float = 0.10,
         balance_cap: Optional[float] = None,
+        reservation_price: Optional[float] = None,
     ) -> Optional[OrderResult]:
-        """Place a maker limit order targeting passive fills and rebates.
+        """Place a maker limit order using Stoikov reservation price or naive offset.
 
-        Pricing strategy: order at midpoint - 0.01 (one tick below mid).
-        This places the order on the passive (maker) side of the book:
-        - Order sits on the book waiting for a taker to cross
-        - When filled, we pay maker fees (often negative = rebate)
-        - The 0.01 offset is the minimum tick size on Polymarket
-
-        Why maker > taker:
-        - Taker fee: ~0.15% → costs eat into edge
-        - Maker fee: ~0% or negative → preserves/enhances edge
-        - Over 1000+ trades, this difference is the margin between
-          profit and loss for small-edge strategies
-
-        We always BUY the directional token (UP token if direction="UP",
-        DOWN token if direction="DOWN"). The bot.py caller selects the
-        correct token_id based on direction.
+        When reservation_price is provided (from Stoikov engine), uses it directly
+        as the limit price for optimal inventory-aware quoting. Falls back to
+        midpoint - 0.01 when Stoikov is unavailable.
 
         Args:
             token_id: Which conditional token to buy
@@ -258,6 +247,7 @@ class OrderExecutor:
             midpoint: Current CLOB midpoint price
             max_exposure_pct: Maximum exposure cap, adjustable via dashboard
             balance_cap: If set, cap effective balance for sizing (pre-compounding)
+            reservation_price: Optional Stoikov reservation price for the order
 
         Returns:
             OrderResult if successfully posted, None on failure
@@ -266,10 +256,12 @@ class OrderExecutor:
         if balance_cap is not None:
             balance = min(balance, balance_cap)
 
-        # Price one tick below midpoint → sits on the passive (maker) side.
-        # This means we might not get filled immediately, but when we do,
-        # we capture the maker rebate.
-        price: float = round(midpoint - 0.01, 2)
+        # Stoikov reservation price takes priority over naive offset
+        if reservation_price is not None:
+            price: float = round(reservation_price, 2)
+        else:
+            # Fallback: one tick below midpoint (maker side)
+            price = round(midpoint - 0.01, 2)
 
         # Sanity check: price must be in valid range for binary tokens
         if price <= 0.0 or price >= 1.0:

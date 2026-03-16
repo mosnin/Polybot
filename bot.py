@@ -178,6 +178,10 @@ class AsyncBot:
         self._orderflow_imbalance: float = 0.0
         self._mm_no_opportunity_count: int = 0
 
+        # Stoikov reservation price engine state
+        self._last_stoikov_check: float = 0.0
+        self._stoikov_state: Optional[dict] = None
+
         # Redis connection for equity history + bot state persistence (optional).
         # Shares the same Redis URL as the model for state continuity across restarts.
         self._redis = None
@@ -350,6 +354,25 @@ class AsyncBot:
                     f"COMPOUNDING ACTIVATED: {self.state.total_trades} trades, "
                     f"{win_rate:.1%} win rate, {avg_daily:.2%} avg daily return"
                 )
+
+    # --- Stoikov Reservation Price ---
+
+    async def _compute_stoikov(
+        self, midpoint: float, remaining: float,
+    ) -> Optional[dict]:
+        """Compute Stoikov reservation price. Throttled to every 1.5s."""
+        now: float = time.time()
+        if now - self._last_stoikov_check < self.config.stoikov_check_interval_secs:
+            return self._stoikov_state  # return cached
+        self._last_stoikov_check = now
+
+        stoikov: dict = self.model.compute_stoikov_reservation_price(
+            midpoint=midpoint,
+            remaining_secs=remaining,
+            gamma=self.config.stoikov_gamma,
+        )
+        self._stoikov_state = stoikov
+        return stoikov
 
     # --- Daily Rebate Tracker ---
 
@@ -677,11 +700,26 @@ class AsyncBot:
             self.logger.warning(f"MM midpoint fetch failed: {e}")
             return False
 
+        # Compute Stoikov reservation prices for both sides
+        stoikov_yes = self.model.compute_stoikov_reservation_price(
+            midpoint=yes_mid,
+            remaining_secs=remaining,
+            gamma=self.config.stoikov_gamma,
+        )
+        stoikov_no = self.model.compute_stoikov_reservation_price(
+            midpoint=no_mid,
+            remaining_secs=remaining,
+            gamma=self.config.stoikov_gamma,
+        )
+        self._stoikov_state = stoikov_yes  # cache for dashboard
+
         mm_signal = self.model.check_market_making_opportunity(
             yes_midpoint=yes_mid,
             no_midpoint=no_mid,
             spread_threshold=self.config.mm_spread_threshold,
             batch_size=self.config.mm_batch_size,
+            stoikov_yes=stoikov_yes,
+            stoikov_no=stoikov_no,
         )
 
         if mm_signal is None:
@@ -696,10 +734,11 @@ class AsyncBot:
         self._orderflow_imbalance = flow["imbalance"]
 
         self.logger.info(
-            f"MM EXPLOSIVE: spread={mm_signal['spread']:.4f} "
-            f"YES={yes_mid:.3f} NO={no_mid:.3f} "
-            f"profit={mm_signal['expected_profit']:.4f} "
-            f"flow={flow['imbalance']:+.3f} favor={flow['favor_side']}"
+            f"MM STOIKOV: spread={mm_signal['spread']:.4f} "
+            f"r_yes={stoikov_yes['reservation_price']:.3f} "
+            f"r_no={stoikov_no['reservation_price']:.3f} "
+            f"σ={stoikov_yes['sigma']:.6f} T-t={remaining:.0f}s "
+            f"flow={flow['imbalance']:+.3f}"
         )
 
         if self.state.test_mode:
@@ -765,6 +804,8 @@ class AsyncBot:
             "mm_spread": mm_signal["spread"],
             "orderflow_imbalance": flow["imbalance"],
             "batch_count": len(yes_orders) + len(no_orders),
+            "stoikov_r": stoikov_yes["reservation_price"],
+            "stoikov_sigma": stoikov_yes["sigma"],
         })
 
         return True
@@ -1057,16 +1098,23 @@ class AsyncBot:
                     else:
                         token_id = self.current_market.no_token_id
 
+                    # Compute Stoikov reservation price for directional orders
+                    stoikov = await self._compute_stoikov(implied_prob_up, remaining)
+                    stoikov_price: Optional[float] = None
+                    if stoikov is not None:
+                        stoikov_price = stoikov["optimal_bid"]
+
                     if self.state.test_mode:
                         self.logger.info(
                             f"[TEST MODE] Signal: {signal.direction} | "
                             f"edge={signal.edge:.4f} | "
                             f"kelly={signal.kelly_fraction:.3f} | "
-                            f"mc_ev={signal.mc_ev:.4f}"
+                            f"mc_ev={signal.mc_ev:.4f} | "
+                            f"stoikov_r={stoikov['reservation_price'] if stoikov else 'N/A'}"
                         )
                         self.state.total_trades += 1
                     else:
-                        # Live mode: place the actual order
+                        # Live mode: place the actual order with Stoikov pricing
                         exposure: float = (
                             self._exposure_override or self.config.max_exposure_pct
                         )
@@ -1127,6 +1175,7 @@ class AsyncBot:
                                 implied_prob_up,
                                 exposure,
                                 balance_cap,
+                                stoikov_price,
                             )
                             results = [single_result] if single_result else []
 
@@ -1194,6 +1243,11 @@ class AsyncBot:
                 "mm_spread_profit": self.state.mm_spread_profit,
                 "orderflow_imbalance": self._orderflow_imbalance,
                 "explosive_mode": self.config.mm_spread_threshold < 0.99,
+                "stoikov_r": self._stoikov_state.get("reservation_price") if self._stoikov_state else None,
+                "stoikov_sigma": self._stoikov_state.get("sigma") if self._stoikov_state else None,
+                "stoikov_gamma": self.config.stoikov_gamma,
+                "stoikov_remaining": self._stoikov_state.get("remaining_secs") if self._stoikov_state else None,
+                "stoikov_skew": self._stoikov_state.get("inventory_skew") if self._stoikov_state else None,
             })
 
     async def run(self) -> None:

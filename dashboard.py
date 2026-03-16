@@ -612,7 +612,7 @@ def main_page() -> None:
                     'background:linear-gradient(90deg,#ff4500,#ff6b00);'
                     'color:white;text-align:center;font-weight:bold;margin-bottom:8px;'
                     'font-size:1.1em">'
-                    'Explosive Mode Active &mdash; Batch Spread Locked</div>',
+                    'Explosive Mode Active &mdash; Stoikov Spread Locked</div>',
                     unsafe_allow_html=True,
                 )
             else:
@@ -621,9 +621,32 @@ def main_page() -> None:
                     'background:linear-gradient(90deg,#ff4500,#cc3700);'
                     'color:white;text-align:center;font-weight:bold;margin-bottom:8px;'
                     'font-size:1.1em">'
-                    'Explosive Mode &mdash; Full Kelly | 15% Exposure | 0.985 Threshold</div>',
+                    'Explosive Mode &mdash; Stoikov Quoting | Full Kelly | 0.985 Threshold</div>',
                     unsafe_allow_html=True,
                 )
+
+        # --- Stoikov Reservation Price Telemetry ---
+        if state.latest_status and state.latest_status.get("stoikov_r") is not None:
+            st.subheader("Stoikov Engine")
+            sk_cols = st.columns(4)
+            with sk_cols[0]:
+                st.metric(
+                    "r (Reservation)",
+                    f"{state.latest_status['stoikov_r']:.3f}",
+                )
+            with sk_cols[1]:
+                st.metric(
+                    "\u03b3 (Gamma)",
+                    f"{state.latest_status.get('stoikov_gamma', 0.15):.2f}",
+                )
+            with sk_cols[2]:
+                st.metric(
+                    "\u03c3 (Volatility)",
+                    f"{state.latest_status.get('stoikov_sigma', 0):.6f}",
+                )
+            with sk_cols[3]:
+                sk_remaining = state.latest_status.get("stoikov_remaining", 0)
+                st.metric("T-t (Remaining)", f"{sk_remaining:.0f}s")
 
         # --- MM / Explosive Metrics ---
         if state.latest_status and state.latest_status.get("mm_trades", 0) > 0:
@@ -645,31 +668,62 @@ def main_page() -> None:
                     imb_label += " (BIASED)"
                 st.metric("Order Flow", imb_label)
 
-        # --- Projected Monthly Return ---
+        # --- Projected Monthly Compounding Curve ---
         if state.latest_status:
             total_trades = state.latest_status.get("total_trades", 0)
             mm_profit = state.latest_status.get("mm_spread_profit", 0)
             balance = state.latest_status.get("current_balance", 0)
-            starting = 100.0  # default starting capital
+            starting = 100.0
 
             if total_trades > 0 and balance > 0:
                 net_return = (balance - starting + mm_profit) / starting
-                # Estimate trades per hour from trade history length
                 if len(state.trades) >= 2:
                     first_ts = state.trades[0].get("timestamp", time.time())
                     last_ts = state.trades[-1].get("timestamp", time.time())
                     elapsed_h = max((last_ts - first_ts) / 3600, 0.1)
                     trades_per_hour = total_trades / elapsed_h
                 else:
-                    trades_per_hour = 12.0  # ~288 windows/day / 24h
-                trades_per_month = trades_per_hour * 24 * 30
+                    trades_per_hour = 12.0
                 edge_per_trade = net_return / total_trades
-                # Compound projected return
-                projected = (1 + edge_per_trade) ** min(trades_per_month, 50000) - 1
-                st.metric(
-                    "Projected Monthly Return",
-                    f"{projected:,.0%}",
+                trades_per_day = trades_per_hour * 24
+
+                # Build 30-day projection curve
+                st.subheader("Projected Monthly Compounding")
+                days = list(range(31))
+                projected_balances = []
+                for d in days:
+                    total_t = trades_per_day * d
+                    proj_bal = starting * (1 + edge_per_trade) ** min(total_t, 50000)
+                    projected_balances.append(proj_bal)
+
+                comp_fig, comp_ax = plt.subplots(figsize=(10, 3.5))
+                comp_ax.plot(
+                    days, projected_balances,
+                    color="#ff4500", linewidth=2.5,
                 )
+                comp_ax.fill_between(
+                    days, starting, projected_balances,
+                    alpha=0.15, color="#ff4500",
+                )
+                comp_ax.axhline(
+                    y=balance, color="#00cc66", linestyle="--",
+                    alpha=0.6, label=f"Current: ${balance:,.0f}",
+                )
+                comp_ax.set_xlabel("Days")
+                comp_ax.set_ylabel("Projected Balance ($)")
+                comp_ax.set_title(
+                    f"Stoikov Compounding \u2014 "
+                    f"${projected_balances[-1]:,.0f} projected at Day 30"
+                )
+                comp_ax.legend()
+                comp_ax.grid(True, alpha=0.2)
+                st.pyplot(comp_fig)
+                plt.close(comp_fig)
+
+                monthly_return = (
+                    (1 + edge_per_trade) ** min(trades_per_day * 30, 50000) - 1
+                )
+                st.metric("Projected Monthly Return", f"{monthly_return:,.0%}")
 
         # --- Row 2: Equity Curve ---
         st.subheader("Equity Curve")

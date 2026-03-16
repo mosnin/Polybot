@@ -103,6 +103,12 @@ class Config:
     # When bid/ask depth delta > threshold, ride the dominant side harder.
     orderflow_imbalance_threshold: float = 0.20  # 20% delta triggers side bias
 
+    # --- Stoikov Reservation Price Engine ---
+    # Avellaneda-Stoikov: r = s - q * gamma * sigma^2 * (T-t)
+    # gamma controls risk aversion (higher = tighter quotes, lower inventory risk)
+    stoikov_gamma: float = 0.15
+    stoikov_check_interval_secs: float = 1.5  # run Stoikov calc every 1.5s
+
     # --- Monte Carlo Simulation ---
     # 1000 paths balances accuracy vs latency. Vectorized numpy keeps this <5ms.
     mc_paths: int = 1000
@@ -240,6 +246,7 @@ def load_config() -> Config:
     orderflow_imbalance_threshold: float = float(
         os.getenv("ORDERFLOW_IMBALANCE_THRESHOLD", "0.20")
     )
+    stoikov_gamma: float = float(os.getenv("STOIKOV_GAMMA", "0.15"))
 
     return Config(
         private_key=private_key,
@@ -256,4 +263,5 @@ def load_config() -> Config:
         mm_cancel_delay_secs=mm_cancel_delay_secs,
         mm_batch_size=mm_batch_size,
         orderflow_imbalance_threshold=orderflow_imbalance_threshold,
+        stoikov_gamma=stoikov_gamma,
     )

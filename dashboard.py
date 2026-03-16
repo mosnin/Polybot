@@ -311,7 +311,7 @@ def _render_backtest_tab() -> None:
     if st.button(
         "Run Backtest",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=st.session_state.backtest_running,
     ):
         st.session_state.backtest_running = True
@@ -360,7 +360,7 @@ def _render_backtest_tab() -> None:
     if st.button(
         "Run Real Polymarket Backtest",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=st.session_state.real_backtest_running,
         key="real_backtest_btn",
     ):
@@ -481,7 +481,7 @@ def _render_backtest_tab() -> None:
                 "P&L": f"${t.get('pnl', 0):+.4f}",
                 "Balance": f"${t.get('balance_after', 0):.2f}",
             })
-        st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(log_rows), width="stretch", hide_index=True)
 
     # --- Windows Summary ---
     st.caption(
@@ -845,7 +845,7 @@ def main_page() -> None:
         # --- Row 3: Trade History Table ---
         st.subheader("Recent Trades (Last 50)")
         df: pd.DataFrame = render_trade_table(state.trades)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
 
         # CSV export button
         if state.trades:
@@ -867,7 +867,7 @@ def main_page() -> None:
 
         # Pause / Resume toggle
         if state.is_paused:
-            if st.button("Resume Trading", type="primary", use_container_width=True):
+            if st.button("Resume Trading", type="primary", width="stretch"):
                 if _CONTROL_QUEUE is not None:
                     try:
                         _CONTROL_QUEUE.put_nowait({"type": "resume"})
@@ -876,7 +876,7 @@ def main_page() -> None:
                 state.is_paused = False
                 st.rerun()
         else:
-            if st.button("Pause Trading", type="secondary", use_container_width=True):
+            if st.button("Pause Trading", type="secondary", width="stretch"):
                 if _CONTROL_QUEUE is not None:
                     try:
                         _CONTROL_QUEUE.put_nowait({"type": "pause"})
@@ -917,7 +917,7 @@ def main_page() -> None:
         # Approve USDC for trading (one-time setup)
         st.subheader("USDC Approval")
         st.caption("One-time approval for Polymarket exchange contracts")
-        if st.button("Approve USDC for Trading", use_container_width=True):
+        if st.button("Approve USDC for Trading", width="stretch"):
             if _PRIVATE_KEY and _RPC_URL:
                 with st.spinner("Broadcasting approval transaction..."):
                     try:
@@ -950,7 +950,7 @@ def main_page() -> None:
             step=10.0,
             key="withdraw_input",
         )
-        if st.button("Execute Withdraw", use_container_width=True):
+        if st.button("Execute Withdraw", width="stretch"):
             if withdraw_amount > 0 and _PRIVATE_KEY and _RPC_URL:
                 with st.spinner("Processing withdrawal..."):
                     try:

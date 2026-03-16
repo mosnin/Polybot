@@ -437,6 +437,20 @@ def main_page() -> None:
         layout="wide",
     )
 
+    # Dark mode CSS + mobile-responsive layout
+    st.markdown("""
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+    .stApp { background-color: #0e1117; }
+    .stMetric label { color: #888; }
+    [data-testid="stSidebar"] { background-color: #161b22; }
+    @media (max-width: 768px) {
+        .stColumns > div { min-width: 45% !important; }
+        .stMetric { font-size: 0.85rem; }
+    }
+</style>
+""", unsafe_allow_html=True)
+
     # Initialize persistent state across reruns
     if "dashboard_state" not in st.session_state:
         st.session_state.dashboard_state = DashboardState()
@@ -498,16 +512,72 @@ def main_page() -> None:
             )
             st.metric(label="Compounding", value=compounding)
 
+        # --- Strategy Health Score ---
+        health_color = "red"
+        health_label = "UNHEALTHY"
+        if state.latest_status:
+            live_wr = state.latest_status.get("wins", 0) / max(
+                state.latest_status.get("total_trades", 1), 1
+            )
+            bt_ok = (
+                (st.session_state.get("backtest_result") or {}).get(
+                    "daily_expectancy", 0
+                )
+                > 0.01
+            )
+            if live_wr >= 0.58 and bt_ok:
+                health_color, health_label = "green", "HEALTHY"
+            elif live_wr >= 0.52 or (
+                state.latest_status.get("total_trades", 0) < 50
+            ):
+                health_color, health_label = "orange", "WARMING UP"
+        st.markdown(
+            f'<div style="padding:8px 16px;border-radius:8px;background:{health_color};'
+            f'color:white;text-align:center;font-weight:bold;margin-bottom:12px">'
+            f"Strategy Health: {health_label}</div>",
+            unsafe_allow_html=True,
+        )
+
         # --- Row 2: Equity Curve ---
         st.subheader("Equity Curve")
         fig: plt.Figure = render_equity_curve(state.equity_curve)
         st.pyplot(fig)
         plt.close(fig)  # free memory
 
+        # --- Cycle Latency Graph ---
+        if state.cycle_latencies:
+            st.subheader("Cycle Latency")
+            lat_fig, lat_ax = plt.subplots(figsize=(10, 2.5))
+            lat_ax.plot(state.cycle_latencies, color="#ff6b6b", linewidth=1)
+            lat_ax.axhline(
+                y=80, color="#ff0000", linestyle="--", alpha=0.5, label="80ms warn"
+            )
+            lat_ax.axhline(
+                y=60, color="#00d4aa", linestyle="--", alpha=0.5, label="60ms target"
+            )
+            lat_ax.set_facecolor("#0e1117")
+            lat_fig.patch.set_facecolor("#0e1117")
+            lat_ax.tick_params(colors="#888")
+            lat_ax.set_ylabel("ms", color="#888")
+            lat_ax.legend(fontsize=8)
+            lat_fig.tight_layout()
+            st.pyplot(lat_fig)
+            plt.close(lat_fig)
+
         # --- Row 3: Trade History Table ---
         st.subheader("Recent Trades (Last 50)")
         df: pd.DataFrame = render_trade_table(state.trades)
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # CSV export button
+        if state.trades:
+            csv_data = render_trade_table(state.trades).to_csv(index=False)
+            st.download_button(
+                label="Export Trade History (CSV)",
+                data=csv_data,
+                file_name="polybot_trades.csv",
+                mime="text/csv",
+            )
 
     # === BACKTEST TAB ===
     with tab_backtest:

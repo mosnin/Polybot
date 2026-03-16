@@ -283,6 +283,65 @@ Polybot/
 └── README.md              # This file
 ```
 
+## How to Audit & Tune
+
+### Re-run Deep Backtest (30 days)
+
+```bash
+cd /home/user/Polybot
+venv/bin/python backtest.py
+```
+
+Downloads 30 days of 1-second BTC ticks, replays ~8,600 windows. Look for:
+- Win rate >= 58%
+- Daily expectancy >= 0.8%
+- Sharpe > 1.0
+- Max drawdown < 25%
+
+Or use the dashboard: **Backtest tab → Run Backtest** button.
+
+### Performance Latency Check
+
+```bash
+tail -f /var/log/polybot/bot.log | grep -i "latency\|slow cycle"
+```
+
+Target: <60ms average cycle. If consistently >80ms, see Troubleshooting.
+
+### Verify Contract Addresses
+
+```bash
+venv/bin/python -c "from config import load_config; load_config(); print('Checksum validation passed')"
+```
+
+This validates all 4 Polymarket contract addresses against EIP-55 checksums.
+
+### Check .env Security
+
+```bash
+ls -la .env  # should show -rw------- (600 permissions)
+chmod 600 .env  # fix if needed
+```
+
+### Tune Model Parameters
+
+Key tuning knobs in `config.py`:
+
+| Parameter | Effect of increasing | Effect of decreasing |
+|-----------|---------------------|---------------------|
+| `min_edge_threshold` | Fewer trades, higher quality | More trades, noisier |
+| `decay_factor` | More weight on recent ticks | Smoother, slower adaptation |
+| `mc_paths` | More accurate MC, +2ms latency | Faster, slightly noisier |
+| `low_vol_threshold` | More batch orders | More single orders |
+| `rebate_depth_threshold` | Rebate mode triggers less often | Triggers more often |
+
+### Monitor Alerts
+
+If SMTP is configured in `.env`, the bot auto-emails on:
+- Drawdown exceeds 15% (early warning before 25% hard stop)
+- Average cycle latency exceeds 80ms for 50+ cycles
+- 3 consecutive API failures (circuit breaker activation)
+
 ## Security
 
 - **Zero custody**: Your private key never leaves the VPS. All signing is local via web3.py.

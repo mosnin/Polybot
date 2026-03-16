@@ -102,8 +102,44 @@ class OrderExecutor:
         self.active_orders: List[OrderResult] = []
         self.logger: logging.Logger = logging.getLogger("Executor")
 
+    def _call_with_retry(
+        self, func, *args, max_retries: int = 3, base_delay: float = 0.5
+    ):
+        """Execute a sync function with exponential backoff on failure.
+
+        Used for read-only CLOB API calls (balance, midpoint, order book).
+        NOT used for order placement — a failed order should not retry
+        to avoid double-ordering.
+
+        Args:
+            func: Callable to execute
+            *args: Arguments to pass to func
+            max_retries: Maximum retry attempts
+            base_delay: Initial delay in seconds (doubles each retry)
+
+        Returns:
+            Return value of func(*args)
+
+        Raises:
+            Last exception if all retries exhausted
+        """
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                return func(*args)
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    self.logger.warning(
+                        f"Retry {attempt+1}/{max_retries} for {func.__name__}: {e} "
+                        f"(next in {delay:.1f}s)"
+                    )
+                    time.sleep(delay)
+        raise last_error
+
     def get_current_balance(self) -> float:
-        """Fetch USDC balance from the CLOB client.
+        """Fetch USDC balance from the CLOB client with retry.
 
         client.get_balance() returns balance in wei (USDC has 6 decimals
         on Polygon), so we divide by 1e6 to get human-readable USDC.
@@ -111,11 +147,11 @@ class OrderExecutor:
         Returns:
             Current USDC balance as float
         """
-        balance_wei: float = float(self.client.get_balance())
+        balance_wei: float = float(self._call_with_retry(self.client.get_balance))
         return balance_wei / 1e6
 
     def get_midpoint(self, token_id: str) -> float:
-        """Get CLOB midpoint price for a conditional token.
+        """Get CLOB midpoint price for a conditional token with retry.
 
         The midpoint = (best_bid + best_ask) / 2. For binary markets,
         this represents the market's implied probability of that outcome.
@@ -126,10 +162,10 @@ class OrderExecutor:
         Returns:
             Midpoint price as float (0.00 to 1.00)
         """
-        return float(self.client.get_midpoint(token_id))
+        return float(self._call_with_retry(self.client.get_midpoint, token_id))
 
     def get_order_book(self, token_id: str) -> dict:
-        """Get full L2 order book for a conditional token.
+        """Get full L2 order book for a conditional token with retry.
 
         Returns dict with 'bids' and 'asks' arrays, each containing
         [price, size] entries sorted by price.
@@ -140,7 +176,7 @@ class OrderExecutor:
         Returns:
             Dict with 'bids' and 'asks' arrays
         """
-        return self.client.get_order_book(token_id)
+        return self._call_with_retry(self.client.get_order_book, token_id)
 
     def _compute_order_size(
         self,

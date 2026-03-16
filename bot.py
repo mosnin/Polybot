@@ -153,6 +153,16 @@ class AsyncBot:
         # Set when an order is placed; resolved when the window ends (new window arrives).
         self._pending_prediction: Optional[dict] = None  # {"direction": str, "entry_price": float}
 
+        # Circuit breaker: halt trading after consecutive API failures
+        self._consecutive_api_failures: int = 0
+        self._circuit_breaker_until: float = 0.0
+        self._CIRCUIT_BREAKER_THRESHOLD: int = 3
+        self._CIRCUIT_BREAKER_COOLDOWN: float = 60.0  # seconds
+
+        # Alert state flags (prevent repeated emails)
+        self._drawdown_alert_sent: bool = False
+        self._latency_alert_sent: bool = False
+
         # Redis connection for equity history + bot state persistence (optional).
         # Shares the same Redis URL as the model for state continuity across restarts.
         self._redis = None
@@ -190,11 +200,33 @@ class AsyncBot:
             (self.state.peak_balance - self.state.current_balance)
             / self.state.peak_balance
         )
+
+        # Early warning at 15% drawdown
+        if drawdown >= 0.15 and not self._drawdown_alert_sent:
+            self._send_alert(
+                "Drawdown Warning",
+                f"Drawdown at {drawdown:.1%}. "
+                f"Peak: ${self.state.peak_balance:.2f}, "
+                f"Current: ${self.state.current_balance:.2f}"
+            )
+            self._drawdown_alert_sent = True
+
+        # Reset alert flag on balance recovery
+        if drawdown < 0.10:
+            self._drawdown_alert_sent = False
+
         if drawdown >= self.config.drawdown_hard_stop_pct:
             self.logger.critical(
                 f"HARD STOP: {drawdown:.1%} drawdown "
                 f"(peak=${self.state.peak_balance:.2f}, "
                 f"current=${self.state.current_balance:.2f})"
+            )
+            self._send_alert(
+                "HARD STOP — Drawdown Limit",
+                f"Bot halted at {drawdown:.1%} drawdown. "
+                f"Peak: ${self.state.peak_balance:.2f}, "
+                f"Current: ${self.state.current_balance:.2f}. "
+                "Manual review required."
             )
             return True
         return False
@@ -217,6 +249,26 @@ class AsyncBot:
             )
             return True
         return False
+
+    def _send_alert(self, subject: str, body: str) -> None:
+        """Send email alert via SMTP. Skips silently if SMTP not configured."""
+        if not self.config.smtp_host or not self.config.alert_email:
+            return
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            msg = MIMEText(body)
+            msg["Subject"] = f"[PolyBot] {subject}"
+            msg["From"] = self.config.smtp_user or "polybot@localhost"
+            msg["To"] = self.config.alert_email
+            with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=10) as server:
+                server.starttls()
+                if self.config.smtp_user and self.config.smtp_pass:
+                    server.login(self.config.smtp_user, self.config.smtp_pass)
+                server.send_message(msg)
+            self.logger.info(f"Alert sent: {subject}")
+        except Exception as e:
+            self.logger.warning(f"Alert email failed: {e}")
 
     def _compute_avg_daily_return(self) -> float:
         """Compute average daily net return from equity history.
@@ -589,6 +641,11 @@ class AsyncBot:
                 await asyncio.sleep(0.5)
                 continue
 
+            # Circuit breaker: skip cycle if cooling down after consecutive API failures
+            if time.time() < self._circuit_breaker_until:
+                await asyncio.sleep(1.0)
+                continue
+
             # Block until next tick arrives from Binance
             tick: PriceTick = await self.tick_queue.get()
 
@@ -614,10 +671,24 @@ class AsyncBot:
                 self.state.current_balance = await loop.run_in_executor(
                     None, self.executor.get_current_balance
                 )
+                self._consecutive_api_failures = 0
             except Exception as e:
                 self.logger.warning(
                     f"Balance fetch failed, using last known: {e}"
                 )
+                self._consecutive_api_failures += 1
+                if self._consecutive_api_failures >= self._CIRCUIT_BREAKER_THRESHOLD:
+                    self._circuit_breaker_until = time.time() + self._CIRCUIT_BREAKER_COOLDOWN
+                    self.logger.critical(
+                        f"CIRCUIT BREAKER: {self._consecutive_api_failures} consecutive "
+                        f"API failures. Cooling down for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
+                    )
+                    self._send_alert(
+                        "Circuit Breaker Activated",
+                        f"{self._consecutive_api_failures} consecutive API failures. "
+                        f"Trading paused for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
+                    )
+                    continue
             self.state.peak_balance = max(
                 self.state.peak_balance, self.state.current_balance
             )
@@ -672,6 +743,18 @@ class AsyncBot:
                 implied_prob_up: float = float(midpoint_result)
             except Exception as e:
                 self.logger.error(f"Midpoint/orderbook fetch failed: {e}")
+                self._consecutive_api_failures += 1
+                if self._consecutive_api_failures >= self._CIRCUIT_BREAKER_THRESHOLD:
+                    self._circuit_breaker_until = time.time() + self._CIRCUIT_BREAKER_COOLDOWN
+                    self.logger.critical(
+                        f"CIRCUIT BREAKER: {self._consecutive_api_failures} consecutive "
+                        f"API failures. Cooling down for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
+                    )
+                    self._send_alert(
+                        "Circuit Breaker Activated",
+                        f"{self._consecutive_api_failures} consecutive API failures. "
+                        f"Trading paused for {self._CIRCUIT_BREAKER_COOLDOWN:.0f}s."
+                    )
                 continue
 
             # Step 6: Compute adaptive min-edge based on real-time CLOB depth.
@@ -814,6 +897,19 @@ class AsyncBot:
             # Step 8: Latency monitor — record cycle, warn if >80ms, auto-tune poll
             self.latency_monitor.record(cycle_ms)
             self.latency_monitor.auto_adjust_poll_interval(self.model.volatility)
+
+            # Alert on sustained latency breach (>80ms avg over 50+ cycles)
+            if (
+                len(self.latency_monitor.cycle_times) >= 50
+                and self.latency_monitor.avg_ms > 80.0
+                and not self._latency_alert_sent
+            ):
+                self._send_alert(
+                    "Latency Breach",
+                    f"Avg cycle latency: {self.latency_monitor.avg_ms:.1f}ms "
+                    f"over {len(self.latency_monitor.cycle_times)} cycles (target: <60ms)."
+                )
+                self._latency_alert_sent = True
 
             # Step 9: Rich console output
             table: Table = self._build_status_table(signal, cycle_ms)

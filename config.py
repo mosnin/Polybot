@@ -8,9 +8,12 @@ Every parameter is tuned for positive expectancy on 5-minute binary BTC markets:
 - Compounding only activates after statistical significance (200 trades)
 """
 
+import logging
 import os
+import stat
 from dataclasses import dataclass
 from dotenv import load_dotenv
+from web3 import Web3
 
 load_dotenv()
 
@@ -151,16 +154,45 @@ class Config:
     # and restores it on startup, preserving winning edge continuity.
     redis_url: str = ""
 
+    # --- Alerting (optional SMTP) ---
+    # When configured, the bot sends email alerts on drawdown warnings,
+    # sustained latency breaches, and circuit breaker activations.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_pass: str = ""
+    alert_email: str = ""
+
 
 def load_config() -> Config:
     """Factory function that reads .env and returns a validated Config.
 
+    SECURITY: private_key is loaded here ONCE, passed only to ClobClient (EIP-712 signing)
+    and dashboard process (for approve/withdraw). It is NEVER logged, printed, or transmitted.
+
     Raises ValueError if required secrets are missing. This fails fast
     at startup rather than mid-trade.
     """
+    _logger = logging.getLogger("Config")
+
+    # Check .env file permissions — warn if readable by group/others
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        mode = os.stat(env_path).st_mode
+        if mode & (stat.S_IRGRP | stat.S_IROTH):
+            _logger.warning(
+                "SECURITY: .env is readable by group/others. "
+                "Run: chmod 600 .env"
+            )
+
     private_key: str = os.getenv("POLYGON_PRIVATE_KEY", "")
     rpc_url: str = os.getenv("ALCHEMY_RPC_URL", "")
     redis_url: str = os.getenv("REDIS_URL", "")
+    smtp_host: str = os.getenv("SMTP_HOST", "")
+    smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user: str = os.getenv("SMTP_USER", "")
+    smtp_pass: str = os.getenv("SMTP_PASS", "")
+    alert_email: str = os.getenv("ALERT_EMAIL", "")
 
     if not private_key or private_key == "0xYOUR_PRIVATE_KEY_HERE":
         raise ValueError(
@@ -173,8 +205,27 @@ def load_config() -> Config:
             "get a free key at https://dashboard.alchemy.com"
         )
 
+    # Validate contract address checksums (EIP-55) to catch tampering or copy-paste errors
+    for name, addr in [
+        ("usdc_token_address", Config.usdc_token_address),
+        ("ctf_exchange_address", Config.ctf_exchange_address),
+        ("neg_risk_ctf_exchange_address", Config.neg_risk_ctf_exchange_address),
+        ("conditional_tokens_address", Config.conditional_tokens_address),
+    ]:
+        expected = Web3.to_checksum_address(addr)
+        if addr != expected:
+            raise ValueError(
+                f"Contract address checksum mismatch for {name}: "
+                f"got {addr}, expected {expected}"
+            )
+
     return Config(
         private_key=private_key,
         alchemy_rpc_url=rpc_url,
         redis_url=redis_url,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_user=smtp_user,
+        smtp_pass=smtp_pass,
+        alert_email=alert_email,
     )

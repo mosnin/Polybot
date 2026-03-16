@@ -396,7 +396,7 @@ def _render_backtest_tab() -> None:
             if result.get("alert_no_markets"):
                 st.warning(
                     "No real Polymarket 5-min BTC markets found for the requested "
-                    "period. Use the standard backtest (Bybit data) as fallback."
+                    "period. Use the standard backtest (OKX data) as fallback."
                 )
         except Exception as e:
             st.error(f"Real backtest failed: {e}")

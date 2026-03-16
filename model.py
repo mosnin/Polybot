@@ -4,7 +4,7 @@ model.py — Bayesian inference + Monte Carlo simulation for edge detection.
 This is the brain of the bot. The core insight driving positive expectancy:
 
 Polymarket 5-min BTC markets are priced by retail participants using lagging
-information. Our Bayesian model updates on sub-20ms Bybit perpetual ticks,
+information. Our Bayesian model updates on sub-20ms OKX perpetual ticks,
 building a posterior distribution for P(BTC up) that leads the CLOB implied
 probability by 1-3 seconds. When the gap (edge) exceeds costs, we trade.
 
@@ -66,7 +66,7 @@ class BayesianModel:
     """Bayesian beta-binomial model for short-term BTC direction prediction.
 
     The model maintains a beta distribution prior over P(next tick is up).
-    Each Bybit tick updates the posterior:
+    Each OKX tick updates the posterior:
     - Price went up   → alpha += 1 (evidence for upward momentum)
     - Price went down → beta += 1  (evidence for downward momentum)
     - No change       → no update  (uninformative observation)
@@ -170,7 +170,7 @@ class BayesianModel:
         where the likelihood is Bernoulli and prior is Beta.
 
         Args:
-            current_price: Latest BTC price from Bybit
+            current_price: Latest BTC price from OKX
             previous_price: Previous tick's price (None on first tick)
         """
         self.price_history.append(current_price)
@@ -481,7 +481,7 @@ class BayesianModel:
         simulation stress-tests whether the edge persists across random paths.
 
         Args:
-            current_price: Latest BTC price from Bybit
+            current_price: Latest BTC price from OKX
             implied_prob_up: CLOB midpoint price of the UP token (= market P(up))
             remaining_seconds: Seconds until this 5-min window resolves
             order_book: Optional CLOB L2 order book for liquidity-aware z-score

@@ -2,12 +2,12 @@
 data_feed.py — Async price streaming and Polymarket market discovery.
 
 Two independent producers feed shared asyncio.Queue instances:
-1. BybitWebSocket — sub-20ms BTC/USDT perpetual ticks via ccxt.pro
+1. OKXWebSocket  — real-time BTC/USDT-SWAP ticks via OKX WS v5 public feed
 2. GammaMarketFinder — discovers active 5-minute BTC Up/Down token IDs
 
-The winning edge starts here: low-latency Bybit price data lets us detect
-momentum shifts before they're reflected in Polymarket CLOB prices. The
-deterministic slug generation for Gamma API eliminates discovery lag.
+OKX public WebSocket requires no API key and has no geo-restrictions.
+Endpoint: wss://ws.okx.com:8443/ws/v5/public
+Channel:  tickers / BTC-USDT-SWAP
 """
 
 import asyncio
@@ -18,12 +18,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
-import ccxt.pro as ccxtpro
 
 
 @dataclass
 class PriceTick:
-    """Single price observation from Bybit perpetual stream.
+    """Single price observation from the OKX WebSocket feed.
 
     Fields capture the full L1 snapshot needed for model updates:
     - last_price: most recent trade price (primary signal)
@@ -59,135 +58,131 @@ class MarketWindow:
     end_timestamp: float  # when window resolves (unix seconds)
 
 
-class BybitWebSocket:
-    """Async Bybit perpetual WebSocket feed via ccxt.pro.
+class OKXWebSocket:
+    """Async OKX public WebSocket feed for BTC-USDT-SWAP tickers.
 
-    Subscribes to BTC/USDT:USDT perpetual swap for two reasons:
-    1. Perpetual has tighter spreads and more volume than spot
-    2. Perpetual price leads spot by ~100ms on average, giving us
-       an information advantage over Polymarket participants using spot feeds
+    Connects to wss://ws.okx.com:8443/ws/v5/public — no API key required,
+    no geo-restrictions. Subscribes to the 'tickers' channel for
+    BTC-USDT-SWAP perpetual swap.
 
-    The watch_ticker loop pushes PriceTick objects to a shared queue
-    consumed by the main trading loop.
+    OKX WS v5 protocol:
+    - Subscribe: send JSON {"op":"subscribe","args":[{"channel":"tickers","instId":"BTC-USDT-SWAP"}]}
+    - Push: {"arg":{...},"data":[{"last":"..","bidPx":"..","askPx":"..","bidSz":"..","askSz":"..","ts":".."}]}
+    - Heartbeat: send text "ping" every 25s, server responds "pong"
     """
 
-    # USDT-margined perpetual swap — highest liquidity BTC instrument on Bybit
-    SYMBOL: str = "BTC/USDT:USDT"
+    WS_URL: str = "wss://ws.okx.com:8443/ws/v5/public"
+    INST_ID: str = "BTC-USDT-SWAP"
+    PING_INTERVAL: float = 25.0   # seconds between heartbeat pings
     MAX_RETRIES: int = 10
-    BASE_DELAY: float = 1.0  # seconds for exponential backoff
 
     def __init__(self, tick_queue: asyncio.Queue) -> None:
-        """Initialize with reference to shared tick queue.
-
-        Args:
-            tick_queue: asyncio.Queue that receives PriceTick objects.
-                        Consumed by bot.py's trade loop.
-        """
         self.tick_queue: asyncio.Queue = tick_queue
-        self.exchange: Optional[ccxtpro.bybit] = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self._running: bool = False
-        self.logger: logging.Logger = logging.getLogger("BybitWS")
+        self.logger: logging.Logger = logging.getLogger("OKXWS")
 
     async def connect(self) -> None:
-        """Initialize the ccxt.pro exchange instance.
-
-        Uses defaultType=swap to route all calls to the futures API.
-        enableRateLimit prevents hitting Bybit's WebSocket message limits.
-        """
-        self.exchange = ccxtpro.bybit(
-            {
-                "options": {"defaultType": "swap"},
-                "enableRateLimit": True,
-            }
-        )
+        """Open the aiohttp session (actual WS connect happens in run_ticker_loop)."""
+        self._session = aiohttp.ClientSession()
         self._running = True
-        self.logger.info(f"Bybit WS initialized for {self.SYMBOL}")
+        self.logger.info(f"OKX WS ready — will connect to {self.WS_URL}")
 
-    async def _watch_with_retry(self, watch_coro_factory, label: str):
-        """Generic retry wrapper with exponential backoff for WS methods.
+    async def _ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Send 'ping' every 25 seconds to keep the connection alive."""
+        while self._running and not ws.closed:
+            await asyncio.sleep(self.PING_INTERVAL)
+            try:
+                await ws.send_str("ping")
+            except Exception:
+                break
 
-        ccxt.pro handles reconnection internally, but network partitions
-        or exchange maintenance can cause prolonged failures. This wrapper
-        ensures graceful degradation rather than crashing the bot.
-
-        Args:
-            watch_coro_factory: Callable returning an awaitable (e.g. watch_ticker)
-            label: Human-readable name for log messages
-
-        Returns:
-            The data from the successful watch call, or None if max retries hit.
-        """
+    async def run_ticker_loop(self) -> None:
+        """Connect, subscribe, and stream ticks. Reconnects on any error."""
         retries: int = 0
         while self._running:
             try:
-                data = await watch_coro_factory()
-                retries = 0  # reset on success — connection is healthy
-                return data
+                async with self._session.ws_connect(
+                    self.WS_URL,
+                    heartbeat=None,          # we handle ping manually
+                    receive_timeout=60.0,    # 60s read timeout
+                ) as ws:
+                    # Subscribe to BTC-USDT-SWAP tickers
+                    await ws.send_str(json.dumps({
+                        "op": "subscribe",
+                        "args": [{"channel": "tickers", "instId": self.INST_ID}],
+                    }))
+                    self.logger.info(f"OKX WS connected — subscribed to {self.INST_ID} tickers")
+                    retries = 0  # reset on successful connect
+
+                    # Start heartbeat task
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
+
+                    try:
+                        async for msg in ws:
+                            if not self._running:
+                                break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                raw = msg.data
+                                if raw == "pong":
+                                    continue  # heartbeat response, ignore
+                                try:
+                                    payload = json.loads(raw)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                # Skip subscribe ack / event messages
+                                if "data" not in payload:
+                                    continue
+
+                                for item in payload["data"]:
+                                    try:
+                                        tick = PriceTick(
+                                            timestamp=float(item["ts"]),
+                                            last_price=float(item["last"]),
+                                            best_bid=float(item["bidPx"]),
+                                            best_ask=float(item["askPx"]),
+                                            bid_volume=float(item.get("bidSz", 0.0)),
+                                            ask_volume=float(item.get("askSz", 0.0)),
+                                        )
+                                        await self.tick_queue.put(tick)
+                                    except (KeyError, ValueError):
+                                        continue
+
+                            elif msg.type in (
+                                aiohttp.WSMsgType.ERROR,
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSED,
+                            ):
+                                self.logger.warning(f"OKX WS closed/error: {msg.type}")
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
+
             except Exception as e:
+                if not self._running:
+                    break
                 retries += 1
-                if retries > self.MAX_RETRIES:
-                    self.logger.error(
-                        f"{label}: max retries ({self.MAX_RETRIES}) exceeded, giving up"
-                    )
-                    raise
-                # Exponential backoff: 2s, 4s, 8s... capped at 60s
-                delay: float = min(self.BASE_DELAY * (2**retries), 60.0)
+                delay: float = min(1.0 * (2 ** retries), 60.0)
                 self.logger.warning(
-                    f"{label} error (retry {retries}/{self.MAX_RETRIES}) "
-                    f"in {delay:.0f}s: {e}"
+                    f"OKX WS error (retry {retries}/{self.MAX_RETRIES}) "
+                    f"reconnecting in {delay:.0f}s: {e}"
                 )
+                if retries > self.MAX_RETRIES:
+                    self.logger.error("OKX WS: max retries exceeded")
+                    raise
                 await asyncio.sleep(delay)
-        return None
-
-    async def run_ticker_loop(self) -> None:
-        """Infinite loop consuming Bybit ticker WebSocket messages.
-
-        Each iteration blocks on watch_ticker until a new message arrives
-        (~50-200ms intervals). The PriceTick is immediately pushed to the
-        shared queue for the trading loop to consume.
-
-        This is the primary data source — every model update starts with
-        a tick from this loop.
-        """
-        self.logger.info("Ticker loop started")
-        while self._running:
-            ticker = await self._watch_with_retry(
-                lambda: self.exchange.watch_ticker(self.SYMBOL), "watch_ticker"
-            )
-            if ticker:
-                tick = PriceTick(
-                    timestamp=ticker["timestamp"],
-                    last_price=ticker["last"],
-                    best_bid=ticker["bid"],
-                    best_ask=ticker["ask"],
-                    bid_volume=ticker.get("bidVolume", 0.0),
-                    ask_volume=ticker.get("askVolume", 0.0),
-                )
-                await self.tick_queue.put(tick)
-
-    async def run_orderbook_loop(self) -> None:
-        """Secondary feed for L2 orderbook depth data.
-
-        Runs alongside the ticker loop to provide depth-weighted midpoint
-        calculations. The orderbook data enriches volatility estimation
-        by revealing large resting orders that may act as support/resistance.
-
-        Currently consumed for monitoring; future enhancement could feed
-        volume-weighted mid into the Bayesian model.
-        """
-        self.logger.info("Orderbook loop started")
-        while self._running:
-            await self._watch_with_retry(
-                lambda: self.exchange.watch_order_book(self.SYMBOL),
-                "watch_order_book",
-            )
 
     async def close(self) -> None:
-        """Gracefully shut down the WebSocket connection."""
+        """Gracefully stop the WebSocket loop."""
         self._running = False
-        if self.exchange:
-            await self.exchange.close()
-            self.logger.info("Bybit WS closed")
+        if self._session:
+            await self._session.close()
+        self.logger.info("OKX WS closed")
 
 
 class GammaMarketFinder:

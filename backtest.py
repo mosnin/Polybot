@@ -6,7 +6,7 @@ window through the full Bayesian + z-score + Monte Carlo pipeline, and
 outputs comprehensive performance metrics.
 
 Supports two modes:
-1. **Synthetic backtest** (``run_backtest``): Uses Bybit perpetual ticks with
+1. **Synthetic backtest** (``run_backtest``): Uses OKX 1-min candles with
    synthesized implied probabilities.  Fast (~30 s), no CLOB connection needed.
 2. **Real Polymarket backtest** (``run_real_backtest``): Discovers actual past
    5-min BTC markets via Gamma API, fetches real CLOB price history, and uses
@@ -70,14 +70,15 @@ def _cache_is_valid(path: str) -> bool:
 
 
 async def download_historical_ticks(days: int = 30) -> List[dict]:
-    """Download 1-second BTC/USDT perpetual candles from Bybit via ccxt.
+    """Download BTC/USDT-SWAP 1-minute candles from OKX REST API.
 
-    Fetches ``days`` worth of 1-second OHLCV data, extracting the close price
-    as the tick price.  Results are cached to disk for 24 hours to avoid
-    redundant API calls.
+    Uses GET /api/v5/market/history-candles with bar=1m (no API key required,
+    no geo-restrictions). Paginates backwards until ``days`` of data is
+    collected, then generates synthetic 1-second ticks by linearly
+    interpolating between each minute's open and close with small Gaussian
+    noise — giving the Bayesian model realistic intra-minute price paths.
 
-    Pagination: ccxt returns max 1000 candles per request.  For 30 days
-    (2,592,000 seconds) this requires ~2,592 requests with rate limiting.
+    30 days = ~43 200 minute candles = ~432 requests at 100/request.
 
     Args:
         days: Number of historical days to download (default 30)
@@ -91,67 +92,103 @@ async def download_historical_ticks(days: int = 30) -> List[dict]:
         with open(cache_file, "r") as f:
             return json.load(f)
 
-    logger.info(f"Downloading {days} days of 1-second BTC ticks from Bybit...")
+    import random
 
-    import ccxt
-
-    exchange = ccxt.bybit({
-        "options": {"defaultType": "swap"},
-        "enableRateLimit": True,
-    })
+    OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
+    INST_ID = "BTC-USDT-SWAP"
+    LIMIT = 100  # max per OKX request
 
     now_ms: int = int(time.time() * 1000)
-    since_ms: int = now_ms - (days * 86400 * 1000)
+    cutoff_ms: int = now_ms - (days * 86400 * 1000)
+
+    logger.info(f"Downloading {days} days of BTC 1m candles from OKX REST API...")
+
+    minute_candles: List[dict] = []  # {"ts": int_ms, "open": float, "close": float}
+    after_ms: Optional[int] = None   # pagination cursor
+    batch: int = 0
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            params: dict = {
+                "instId": INST_ID,
+                "bar": "1m",
+                "limit": str(LIMIT),
+            }
+            if after_ms is not None:
+                params["after"] = str(after_ms)
+
+            retries: int = 0
+            while True:
+                try:
+                    async with session.get(
+                        OKX_CANDLES_URL,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        resp.raise_for_status()
+                        payload = await resp.json()
+                    break
+                except Exception as e:
+                    retries += 1
+                    if retries > 8:
+                        raise
+                    delay = min(2.0 * (2 ** retries), 30.0)
+                    logger.warning(f"OKX fetch error (retry {retries}): {e}, wait {delay:.0f}s")
+                    await asyncio.sleep(delay)
+
+            data = payload.get("data", [])
+            if not data:
+                break  # no more candles
+
+            # OKX returns newest-first; each row: [ts, open, high, low, close, vol, ...]
+            for row in data:
+                ts = int(row[0])
+                if ts < cutoff_ms:
+                    # Reached our target lookback — stop
+                    minute_candles.sort(key=lambda c: c["ts"])
+                    break
+                minute_candles.append({
+                    "ts": ts,
+                    "open": float(row[1]),
+                    "close": float(row[4]),
+                })
+            else:
+                # All rows in this batch were within range — keep paginating
+                after_ms = int(data[-1][0])  # oldest ts in this batch
+                batch += 1
+                if batch % 50 == 0:
+                    pct = max(0.0, (now_ms - after_ms) / (now_ms - cutoff_ms) * 100)
+                    logger.info(
+                        f"OKX download: {pct:.0f}% ({len(minute_candles):,} candles)"
+                    )
+                await asyncio.sleep(0.12)  # ~8 req/s, stay under rate limit
+                continue
+            break  # inner break was hit
+
+    minute_candles.sort(key=lambda c: c["ts"])
+    logger.info(f"Downloaded {len(minute_candles):,} 1-minute candles from OKX")
+
+    # Generate synthetic 1-second ticks by interpolating between candle open/close
     all_ticks: List[dict] = []
-    batch_count: int = 0
-
-    current_since: int = since_ms
-    while current_since < now_ms:
-        try:
-            candles = exchange.fetch_ohlcv(
-                "BTC/USDT:USDT",
-                timeframe="1s",
-                since=current_since,
-                limit=1000,
-            )
-        except Exception as e:
-            logger.warning(f"Fetch error at batch {batch_count}: {e}, retrying...")
-            await asyncio.sleep(2.0)
-            continue
-
-        if not candles:
-            break
-
-        for candle in candles:
-            # candle = [timestamp_ms, open, high, low, close, volume]
+    for candle in minute_candles:
+        ts_start = candle["ts"]
+        open_px = candle["open"]
+        close_px = candle["close"]
+        for s in range(60):
+            alpha = s / 59.0
+            base = open_px + alpha * (close_px - open_px)
+            # 1 basis-point Gaussian noise simulates realistic tick noise
+            noise = random.gauss(0.0, base * 0.0001)
             all_ticks.append({
-                "timestamp": int(candle[0]),
-                "price": float(candle[4]),  # close price
+                "timestamp": ts_start + s * 1000,
+                "price": max(1.0, base + noise),
             })
 
-        # Advance past the last candle's timestamp
-        current_since = int(candles[-1][0]) + 1000  # +1 second
-        batch_count += 1
-
-        # Rate limiting — respect exchange limits
-        rate_delay: float = exchange.rateLimit / 1000.0
-        await asyncio.sleep(rate_delay)
-
-        # Progress logging every 500 batches (~500k ticks)
-        if batch_count % 500 == 0:
-            pct: float = (current_since - since_ms) / (now_ms - since_ms) * 100
-            logger.info(
-                f"Download progress: {pct:.1f}% "
-                f"({len(all_ticks):,} ticks, {batch_count} batches)"
-            )
-
-    # Sort chronologically (should already be, but ensure)
     all_ticks.sort(key=lambda t: t["timestamp"])
 
-    # Cache to disk
     logger.info(
-        f"Download complete: {len(all_ticks):,} ticks over {days} days. "
-        f"Caching to {cache_file}"
+        f"Generated {len(all_ticks):,} synthetic ticks from {len(minute_candles):,} "
+        f"1-minute candles. Caching to {cache_file}"
     )
     with open(cache_file, "w") as f:
         json.dump(all_ticks, f)
@@ -356,7 +393,7 @@ def _compute_backtest_metrics(
     total_windows: int,
     config: Config,
     initial_timestamp: Optional[int] = None,
-    data_source: str = "bybit_synthetic",
+    data_source: str = "okx_synthetic",
 ) -> dict:
     """Compute backtest summary metrics from a list of raw trade signals.
 
@@ -542,7 +579,7 @@ async def run_backtest(
         total_windows=total_windows,
         config=config,
         initial_timestamp=ticks[0]["timestamp"],
-        data_source="bybit_synthetic",
+        data_source="okx_synthetic",
     )
 
 
@@ -814,7 +851,7 @@ def simulate_real_window(
     by the actual market resolution, not a price comparison.
 
     Args:
-        btc_ticks: Bybit 1s BTC prices for this 5-min window
+        btc_ticks: OKX 1-min interpolated prices for this 5-min window
         clob_prices: CLOB minute-by-minute prices [{"t": unix, "p": float}]
         resolution: "YES" or "NO" — the actual market outcome
         config: Bot configuration
@@ -902,7 +939,7 @@ async def run_real_backtest(
     """Run backtest using real Polymarket CLOB data and market resolutions.
 
     Pipeline:
-    1. Download Bybit 1s ticks (reuse ``download_historical_ticks``)
+    1. Download OKX 1-min candles (reuse ``download_historical_ticks``)
     2. Discover real Polymarket 5-min BTC markets via Gamma API
     3. Fetch CLOB price history for each discovered market
     4. Align BTC ticks with CLOB windows

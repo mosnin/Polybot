@@ -333,18 +333,10 @@ def simulate_window(
     current_price: float = window_ticks[eval_idx - 1]["price"]
     remaining_seconds: float = float(n_ticks - eval_idx)  # ~1 tick per second
 
-    # Synthesize implied probability modeling CLOB lag + dampening.
-    # Real Polymarket CLOBs respond SLOWER than the underlying BTC price:
-    # 1. Time lag: CLOB sees price from ~30s ago
-    # 2. Dampening: CLOB only partially adjusts (retail limit orders are sticky)
-    # The bot's edge = seeing current price + full sensitivity vs CLOB's stale view.
-    CLOB_LAG: int = 30
-    CLOB_DAMPENING: float = 0.5  # CLOB reflects only 50% of the probability shift
-    lagged_idx: int = max(0, eval_idx - 1 - CLOB_LAG)
-    lagged_price: float = window_ticks[lagged_idx]["price"]
-    raw_implied: float = _price_to_prob(lagged_price, open_price)
-    # Dampen: pull implied toward 0.5 (CLOB is stickier than true price)
-    implied_prob_up: float = 0.5 + (raw_implied - 0.5) * CLOB_DAMPENING
+    # Real Polymarket 5-min BTC token price is ~$0.50 (roughly even odds).
+    # The bot's edge comes from predicting direction better than a coin flip.
+    # Use 0.50 as implied — this is the honest double-or-nothing test.
+    implied_prob_up: float = 0.50
 
     # Run full evaluation pipeline (no order_book → conservative defaults)
     signal = model.evaluate(
@@ -979,7 +971,7 @@ def simulate_real_window(
         "kelly_fraction": signal.kelly_fraction,
         "entry_price": current_price,
         "exit_price": exit_price,
-        "implied_prob": implied_prob_up,
+        "implied_prob": signal.implied_prob,  # directional token price paid
         "won": won,
     }
 

@@ -48,7 +48,6 @@ apt install -y -qq \
     python3-pip \
     git \
     supervisor \
-    redis-server \
     curl \
     > /dev/null 2>&1
 
@@ -76,7 +75,7 @@ python3.11 -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/pip" install --quiet -r "${POLYBOT_DIR}/requirements.txt"
 
 # Additional deployment dependencies
-"${VENV_DIR}/bin/pip" install --quiet redis pyngrok
+"${VENV_DIR}/bin/pip" install --quiet pyngrok
 
 echo "  Python venv ready at ${VENV_DIR}"
 
@@ -108,8 +107,7 @@ if [ ! -f "${POLYBOT_DIR}/.env" ]; then
     echo "  STARTING_CAPITAL=100"
     echo "  TEST_MODE=true"
     echo "  ENABLE_DASHBOARD=true"
-    echo "  REDIS_URL=redis://localhost:6379/0"
-    echo "  SMTP_HOST="
+ echo "  SMTP_HOST="
     echo "  SMTP_PORT=587"
     echo "  SMTP_USER="
     echo "  SMTP_PASS="
@@ -151,19 +149,8 @@ fi
 
 echo "  .env validated — keys are set."
 
-# ---- Phase 6: Redis Setup ----
-echo "[6/8] Configuring Redis..."
-systemctl enable redis-server > /dev/null 2>&1
-systemctl start redis-server
-# Verify Redis is running
-if redis-cli ping > /dev/null 2>&1; then
-    echo "  Redis running on localhost:6379"
-else
-    echo "  WARNING: Redis not responding. Model state persistence disabled."
-fi
-
-# ---- Phase 7: One-Time USDC Approval ----
-echo "[7/8] Running USDC approval..."
+# ---- Phase 6: One-Time USDC Approval ----
+echo "[6/8] Running USDC approval..."
 echo "  This approves the Polymarket exchange contracts to trade USDC."
 echo "  (One-time operation — costs ~$0.01 in gas)"
 echo ""
@@ -177,8 +164,8 @@ cd "${POLYBOT_DIR}"
     echo ""
 }
 
-# ---- Phase 8: Supervisor Setup ----
-echo "[8/8] Configuring Supervisor..."
+# ---- Phase 7: Supervisor Setup ----
+echo "[7/8] Configuring Supervisor..."
 
 # Rewrite template paths to match this deployment's actual location
 sed -e "s|/home/user/Polybot|${POLYBOT_DIR}|g" \

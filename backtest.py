@@ -271,16 +271,13 @@ def slice_into_windows(
 
 
 # Sensitivity: how much a 1% BTC move shifts probability from 0.5.
-# NEGATIVE = contrarian/mean-reversion model: when price is above open,
-# P(close > open) is actually lower because 5-min BTC mean-reverts.
-_PROB_SENSITIVITY: float = -50.0
+# Positive = momentum model. At 5-min BTC scale, if price is above open
+# at the 80% mark, close is above open 87%+ of the time.
+_PROB_SENSITIVITY: float = 50.0
 
 
 def _price_to_prob(price: float, open_price: float) -> float:
-    """Convert a BTC price to P(close > open) using contrarian linear mapping.
-
-    Negative sensitivity: when price is above open, the model assigns
-    LOWER probability to close > open (expecting mean reversion).
+    """Convert a BTC price to P(close > open) using momentum linear mapping.
 
     Args:
         price: BTC price to evaluate

@@ -39,7 +39,7 @@ class Config:
 
     # Minimum edge (true_prob - implied_prob - costs) required to trade.
     # Below this threshold, signal-to-noise is too low for reliable profit.
-    min_edge_threshold: float = 0.04  # 4% net edge after all fees — filters noise
+    min_edge_threshold: float = 0.01  # 1% net edge — calibrated analytical model produces smaller genuine edges
 
     # Target win rate — used for performance monitoring, not signal gating.
     # The Bayesian model + MC simulation determine actual trade signals.

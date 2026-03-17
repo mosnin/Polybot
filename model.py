@@ -17,6 +17,7 @@ All computations are vectorized numpy — total evaluate() latency target <30ms.
 
 import json
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -608,7 +609,8 @@ class BayesianModel:
         return abs((spread - mean) / std)
 
     def _monte_carlo(
-        self, current_price: float, remaining_seconds: float, direction: str
+        self, current_price: float, remaining_seconds: float, direction: str,
+        open_price: Optional[float] = None,
     ) -> Tuple[float, float, float]:
         """Simulate 1000 price paths to estimate expected value of the trade.
 
@@ -654,11 +656,13 @@ class BayesianModel:
             -0.5 * vol_scaled**2 + vol_scaled * z
         )
 
-        # Binary outcome: did price move in our predicted direction?
+        # Binary outcome: did price end above/below window OPEN?
+        # Matches Polymarket resolution (close vs open), not continuation from eval point.
+        ref_price: float = open_price if open_price is not None else current_price
         if direction == "UP":
-            wins: np.ndarray = terminal_prices > current_price
+            wins: np.ndarray = terminal_prices > ref_price
         else:
-            wins = terminal_prices < current_price
+            wins = terminal_prices < ref_price
 
         win_prob: float = float(np.mean(wins))
 
@@ -733,16 +737,34 @@ class BayesianModel:
         """
         start: float = time.perf_counter()
 
-        true_prob: float = self.true_prob_up
+        # Analytical P(close > open) from GBM model.
+        # Given current position relative to open and remaining volatility,
+        # this is a well-calibrated probability — not a backward-looking count.
+        open_px: float = self._window_open_price if self._window_open_price else current_price
+        vol: float = self.volatility
+        if vol < 1e-10 or remaining_seconds <= 0 or open_px <= 0 or current_price <= 0:
+            true_prob = 0.5
+        else:
+            vol_scaled: float = vol * math.sqrt(remaining_seconds)
+            if vol_scaled < 1e-10:
+                true_prob = 0.5
+            else:
+                log_ratio: float = math.log(current_price / open_px) / vol_scaled
+                true_prob = 0.5 * (1.0 + math.erf(log_ratio / math.sqrt(2.0)))
 
-        # Determine which direction has edge and compute directional probabilities
-        if true_prob >= 0.5:
+        # Determine which direction has edge by comparing both sides.
+        # Pick the direction where true_prob exceeds implied_prob (underpriced token).
+        # Edge UP  = true_prob - implied_prob_up  (model thinks UP more likely than market)
+        # Edge DOWN = implied_prob_up - true_prob  (model thinks DOWN more likely than market)
+        edge_up: float = true_prob - implied_prob_up
+        edge_down: float = implied_prob_up - true_prob  # = (1-true) - (1-implied)
+
+        if edge_up >= edge_down:
             direction: str = "UP"
             directional_true: float = true_prob
             directional_implied: float = implied_prob_up
         else:
             direction = "DOWN"
-            # P(down) = 1 - P(up) for both true and implied
             directional_true = 1.0 - true_prob
             directional_implied = 1.0 - implied_prob_up
 
@@ -779,7 +801,7 @@ class BayesianModel:
         mc_win_prob: float
         mc_variance: float
         mc_ev, mc_win_prob, mc_variance = self._monte_carlo(
-            current_price, remaining_seconds, direction
+            current_price, remaining_seconds, direction, open_price=open_px
         )
 
         # Gate 4: MC expected value must be positive

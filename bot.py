@@ -77,7 +77,11 @@ class BotState:
     mm_active: bool = False
     # Balance history for daily return calculation (compounding gate).
     # Stores (unix_timestamp, balance) tuples. Capped at 50k entries (~14 hours).
-    equity_history: List[Tuple[float, float]] = field(default_factory=list)
+    # Using a deque with maxlen for automatic memory management instead of
+    # manual list trimming — eliminates the periodic O(n) slice operation.
+    equity_history: Deque[Tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=50000)
+    )
 
 
 class AsyncBot:
@@ -131,6 +135,18 @@ class AsyncBot:
             round_trip_cost=config.round_trip_cost_pct,
             redis_url=config.redis_url,
             decay_factor=config.decay_factor,
+            mtf_fast_span=config.mtf_fast_span,
+            mtf_medium_span=config.mtf_medium_span,
+            mtf_slow_span=config.mtf_slow_span,
+            mtf_min_agreement=config.mtf_min_agreement,
+            vol_sizing_enabled=config.vol_sizing_enabled,
+            vol_sizing_lookback=config.vol_sizing_lookback,
+            vol_sizing_floor=config.vol_sizing_floor,
+            vol_sizing_ceiling=config.vol_sizing_ceiling,
+            mean_reversion_enabled=config.mean_reversion_enabled,
+            spread_history_maxlen=config.spread_history_maxlen,
+            mean_reversion_z_threshold=config.mean_reversion_z_threshold,
+            mean_reversion_boost=config.mean_reversion_boost,
         )
         self.executor: OrderExecutor = OrderExecutor(
             private_key=config.private_key,
@@ -302,7 +318,7 @@ class AsyncBot:
             Average daily return as a fraction (0.01 = 1%), or 0.0
             if insufficient data (< 1 complete day).
         """
-        history: List[Tuple[float, float]] = self.state.equity_history
+        history = self.state.equity_history
         if len(history) < 2:
             return 0.0
 
@@ -421,7 +437,7 @@ class AsyncBot:
         try:
             import json
             state: str = json.dumps({
-                "equity_history": self.state.equity_history[-50000:],
+                "equity_history": list(self.state.equity_history),
                 "wins": self.state.wins,
                 "losses": self.state.losses,
                 "consecutive_losses": self.state.consecutive_losses,
@@ -450,7 +466,10 @@ class AsyncBot:
             if raw is None:
                 return
             data: dict = json.loads(raw)
-            self.state.equity_history = data.get("equity_history", [])
+            loaded_history = data.get("equity_history", [])
+            self.state.equity_history = deque(
+                [(ts, bal) for ts, bal in loaded_history], maxlen=50000
+            )
             self.state.wins = int(data.get("wins", 0))
             self.state.losses = int(data.get("losses", 0))
             self.state.consecutive_losses = int(data.get("consecutive_losses", 0))
@@ -564,6 +583,9 @@ class AsyncBot:
             table.add_row("MC Win Prob", f"{signal.mc_win_prob:.1%}")
             table.add_row("MC Variance", f"{signal.mc_variance:.6f}")
             table.add_row("Kelly Fraction", f"{signal.kelly_fraction:.3f}")
+            table.add_row("MTF Agreement", f"{signal.mtf_agreement:.0%}")
+            table.add_row("Vol Scalar", f"{signal.vol_scalar:.2f}x")
+            table.add_row("Spread Z", f"{signal.spread_z:.2f}")
             table.add_row("Model Latency", f"{signal.computation_ms:.1f}ms")
             # Projected profit per trade = edge * position_size
             projected_profit: float = signal.edge * (
@@ -994,12 +1016,11 @@ class AsyncBot:
                 self.state.peak_balance, self.state.current_balance
             )
 
-            # Track balance for daily return calculation (compounding gate)
+            # Track balance for daily return calculation (compounding gate).
+            # Deque with maxlen=50000 auto-evicts oldest entries — no manual trim needed.
             self.state.equity_history.append(
                 (time.time(), self.state.current_balance)
             )
-            if len(self.state.equity_history) > 50000:
-                self.state.equity_history = self.state.equity_history[-50000:]
 
             # Push live balance to dashboard
             self._push_event({
@@ -1198,6 +1219,9 @@ class AsyncBot:
                                 "outcome": None,
                                 "gas_paid": self.config.gas_buffer_usdc,
                                 "net_pnl": None,
+                                "mtf_agreement": signal.mtf_agreement,
+                                "vol_scalar": signal.vol_scalar,
+                                "spread_z": signal.spread_z,
                             })
 
                         # Reset MM miss counter — directional trade fired as tie-breaker

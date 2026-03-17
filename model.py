@@ -48,6 +48,9 @@ class Signal:
     - mc_variance: variance of MC payoffs (risk measure)
     - kelly_fraction: optimal position size as fraction of bankroll
     - computation_ms: total time for evaluate() call (latency monitoring)
+    - mtf_agreement: multi-timeframe momentum agreement score (0-1)
+    - vol_scalar: volatility-based sizing multiplier applied to Kelly
+    - spread_z: z-score of current spread vs rolling history (mean reversion)
     """
 
     direction: str  # "UP" or "DOWN"
@@ -60,6 +63,9 @@ class Signal:
     mc_variance: float
     kelly_fraction: float
     computation_ms: float
+    mtf_agreement: float = 1.0
+    vol_scalar: float = 1.0
+    spread_z: float = 0.0
 
 
 class BayesianModel:
@@ -94,6 +100,18 @@ class BayesianModel:
         round_trip_cost: float = 0.003,
         redis_url: Optional[str] = None,
         decay_factor: float = 0.9,
+        mtf_fast_span: int = 10,
+        mtf_medium_span: int = 30,
+        mtf_slow_span: int = 100,
+        mtf_min_agreement: float = 0.66,
+        vol_sizing_enabled: bool = True,
+        vol_sizing_lookback: int = 50,
+        vol_sizing_floor: float = 0.3,
+        vol_sizing_ceiling: float = 1.5,
+        mean_reversion_enabled: bool = True,
+        spread_history_maxlen: int = 200,
+        mean_reversion_z_threshold: float = 1.5,
+        mean_reversion_boost: float = 1.3,
     ) -> None:
         """Initialize with uninformative beta prior.
 
@@ -107,6 +125,18 @@ class BayesianModel:
                        If None or redis-py not installed, persistence is disabled.
             decay_factor: Exponential decay for tick weighting (0.9 = 10% decay).
                           Recent ticks are weighted heavier in alpha/beta computation.
+            mtf_fast_span: Fast EMA span in ticks (~30s).
+            mtf_medium_span: Medium EMA span in ticks (~1.5m).
+            mtf_slow_span: Slow EMA span in ticks (~5m).
+            mtf_min_agreement: Minimum fraction of timeframes agreeing (0-1).
+            vol_sizing_enabled: Whether to scale Kelly by inverse volatility.
+            vol_sizing_lookback: Ticks for baseline volatility estimation.
+            vol_sizing_floor: Minimum vol sizing scalar (0.3 = 30% of Kelly).
+            vol_sizing_ceiling: Maximum vol sizing scalar (1.5 = 150% of Kelly).
+            mean_reversion_enabled: Whether to detect spread mean reversion.
+            spread_history_maxlen: Rolling window for spread z-score.
+            mean_reversion_z_threshold: Spread z above this = MR opportunity.
+            mean_reversion_boost: Kelly multiplier when MR detected.
         """
         # Beta distribution parameters — start uninformative
         self.alpha: float = 1.0
@@ -126,6 +156,35 @@ class BayesianModel:
 
         self.tick_count: int = 0
         self.logger: logging.Logger = logging.getLogger("Model")
+
+        # --- Multi-Timeframe Momentum (EMA-based) ---
+        # Three EMA windows capture momentum at different time scales.
+        # When all agree on direction, signal confidence is highest.
+        self._mtf_fast_span: int = mtf_fast_span
+        self._mtf_medium_span: int = mtf_medium_span
+        self._mtf_slow_span: int = mtf_slow_span
+        self._mtf_min_agreement: float = mtf_min_agreement
+        # EMA state: initialized to None, set on first price
+        self._ema_fast: Optional[float] = None
+        self._ema_medium: Optional[float] = None
+        self._ema_slow: Optional[float] = None
+
+        # --- Volatility-Adjusted Sizing ---
+        # Tracks longer price history for baseline vol estimation.
+        self._vol_sizing_enabled: bool = vol_sizing_enabled
+        self._vol_sizing_lookback: int = vol_sizing_lookback
+        self._vol_sizing_floor: float = vol_sizing_floor
+        self._vol_sizing_ceiling: float = vol_sizing_ceiling
+        self._vol_history: Deque[float] = deque(maxlen=vol_sizing_lookback)
+
+        # --- Mean Reversion Detection ---
+        # Tracks the edge (true_prob - implied_prob) over time.
+        # When current spread is abnormally wide vs history, it's likely
+        # to revert — which means our directional bet has extra tailwind.
+        self._mean_reversion_enabled: bool = mean_reversion_enabled
+        self._spread_history: Deque[float] = deque(maxlen=spread_history_maxlen)
+        self._mr_z_threshold: float = mean_reversion_z_threshold
+        self._mr_boost: float = mean_reversion_boost
 
         # Redis connection for Bayesian state persistence (optional).
         # Sub-1ms SET on localhost — no impact on 80ms cycle budget.
@@ -150,12 +209,21 @@ class BayesianModel:
         Called by bot.py when GammaMarketFinder discovers a new 5-min window.
         This prevents momentum from the previous window bleeding into signals
         for the new window — each window is an independent event.
+
+        NOTE: _vol_history and _spread_history are NOT cleared on reset.
+        They accumulate across windows to build a stable baseline for
+        volatility normalization and mean reversion detection. This is
+        intentional — cross-window context improves these estimators.
         """
         self.alpha = 1.0
         self.beta = 1.0
         self.price_history.clear()
         self.tick_directions.clear()
         self.tick_count = 0
+        # Reset EMAs (each window starts fresh for momentum)
+        self._ema_fast = None
+        self._ema_medium = None
+        self._ema_slow = None
         self._save_to_redis()
 
     def update(self, current_price: float, previous_price: Optional[float]) -> None:
@@ -169,12 +237,20 @@ class BayesianModel:
             P(up | data) ∝ P(data | up) * P(up)
         where the likelihood is Bernoulli and prior is Beta.
 
+        Also updates multi-timeframe EMAs and volatility history
+        for the advanced statistical filters.
+
         Args:
             current_price: Latest BTC price from OKX
             previous_price: Previous tick's price (None on first tick)
         """
         self.price_history.append(current_price)
         self.tick_count += 1
+
+        # Update multi-timeframe EMAs on every tick.
+        # EMA formula: ema = alpha * price + (1 - alpha) * ema_prev
+        # where alpha = 2 / (span + 1)
+        self._update_ema(current_price)
 
         if previous_price is None:
             return  # first tick — no direction to observe
@@ -186,6 +262,11 @@ class BayesianModel:
         else:
             self.tick_directions.append(0)
 
+        # Track per-tick volatility across windows for vol-adjusted sizing.
+        # This builds a stable vol baseline that persists across window resets.
+        tick_return: float = (current_price - previous_price) / previous_price
+        self._vol_history.append(tick_return)
+
         # Recompute alpha/beta using exponential decay weighting.
         # Recent ticks get weight ~1.0, older ticks decay by factor^age.
         self.alpha, self.beta = apply_decay_weights(
@@ -194,12 +275,37 @@ class BayesianModel:
 
         self._save_to_redis()
 
+    def _update_ema(self, price: float) -> None:
+        """Update all three EMA timeframes with new price.
+
+        EMA is an exponentially weighted moving average that reacts faster
+        to recent prices than SMA. The smoothing factor alpha = 2/(span+1)
+        controls responsiveness:
+        - Fast (span=10): alpha=0.182, reacts in ~5 ticks
+        - Medium (span=30): alpha=0.065, reacts in ~15 ticks
+        - Slow (span=100): alpha=0.020, reacts in ~50 ticks
+        """
+        for attr, span in [
+            ("_ema_fast", self._mtf_fast_span),
+            ("_ema_medium", self._mtf_medium_span),
+            ("_ema_slow", self._mtf_slow_span),
+        ]:
+            current = getattr(self, attr)
+            if current is None:
+                setattr(self, attr, price)
+            else:
+                alpha = 2.0 / (span + 1)
+                setattr(self, attr, alpha * price + (1.0 - alpha) * current)
+
     def _save_to_redis(self) -> None:
         """Persist current Bayesian state to Redis.
 
         Called after every update() and reset(). Synchronous but fast —
         localhost SET with ~200-byte payload completes in <0.5ms.
         Fails silently so the model always continues operating.
+
+        Saves cross-window state (vol_history, spread_history) separately
+        so they survive both window resets and process restarts.
         """
         if self._redis is None:
             return
@@ -212,6 +318,17 @@ class BayesianModel:
                 "tick_count": self.tick_count,
             })
             self._redis.set("polybot:model_state", state)
+            # Cross-window state saved less frequently (every 10th tick)
+            # to avoid bloating Redis writes on every tick
+            if self.tick_count % 10 == 0:
+                cross_window: str = json.dumps({
+                    "vol_history": list(self._vol_history),
+                    "spread_history": list(self._spread_history),
+                    "ema_fast": self._ema_fast,
+                    "ema_medium": self._ema_medium,
+                    "ema_slow": self._ema_slow,
+                })
+                self._redis.set("polybot:model_cross_window", cross_window)
         except Exception:
             pass  # never block the trading loop for persistence
 
@@ -221,6 +338,9 @@ class BayesianModel:
         If Redis has prior state, the model resumes with accumulated
         evidence instead of starting from an uninformative prior.
         This preserves winning edge continuity across process restarts.
+
+        Also restores cross-window state (vol_history, spread_history)
+        so volatility baseline and mean reversion context survive restarts.
         Fails silently — uses default uninformative prior on any error.
         """
         if self._redis is None:
@@ -245,6 +365,32 @@ class BayesianModel:
             )
         except Exception as e:
             self.logger.warning(f"Could not load Redis state: {e}")
+
+        # Restore cross-window state separately
+        try:
+            raw_cw = self._redis.get("polybot:model_cross_window")
+            if raw_cw is None:
+                return
+            cw: dict = json.loads(raw_cw)
+            self._vol_history = deque(
+                cw.get("vol_history", []), maxlen=self._vol_sizing_lookback
+            )
+            self._spread_history = deque(
+                cw.get("spread_history", []), maxlen=self._spread_history.maxlen
+            )
+            if cw.get("ema_fast") is not None:
+                self._ema_fast = float(cw["ema_fast"])
+            if cw.get("ema_medium") is not None:
+                self._ema_medium = float(cw["ema_medium"])
+            if cw.get("ema_slow") is not None:
+                self._ema_slow = float(cw["ema_slow"])
+            self.logger.info(
+                f"Restored cross-window state from Redis "
+                f"(vol_pts={len(self._vol_history)}, "
+                f"spread_pts={len(self._spread_history)})"
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not load cross-window state: {e}")
 
     @property
     def true_prob_up(self) -> float:
@@ -364,6 +510,122 @@ class BayesianModel:
             # Near-zero volatility means price hasn't moved — no signal
             return 0.0
         return (true_prob - implied_prob) / (vol * liquidity_factor)
+
+    def compute_mtf_agreement(self, direction: str) -> float:
+        """Compute multi-timeframe momentum agreement score.
+
+        Checks how many EMA timeframes agree with the proposed direction:
+        - Price > EMA = bullish signal for that timeframe
+        - Price < EMA = bearish signal for that timeframe
+
+        Agreement score = fraction of timeframes confirming direction.
+        Score of 1.0 means all three timeframes confirm (strongest signal).
+        Score of 0.0 means all three disagree (counter-trend, avoid).
+
+        This is the same principle used by trend-following funds:
+        multi-timeframe confluence reduces false signals by 40-60%.
+
+        Args:
+            direction: "UP" or "DOWN"
+
+        Returns:
+            Agreement score between 0.0 and 1.0
+        """
+        if len(self.price_history) < 2:
+            return 1.0  # insufficient data, don't filter
+
+        current_price: float = self.price_history[-1]
+        confirmations: int = 0
+        total: int = 0
+
+        for ema in (self._ema_fast, self._ema_medium, self._ema_slow):
+            if ema is None:
+                continue
+            total += 1
+            if direction == "UP" and current_price > ema:
+                confirmations += 1
+            elif direction == "DOWN" and current_price < ema:
+                confirmations += 1
+
+        if total == 0:
+            return 1.0
+        return confirmations / total
+
+    def compute_vol_scalar(self) -> float:
+        """Compute volatility-adjusted position sizing scalar.
+
+        The idea: size inversely to realized volatility.
+        - In calm markets with strong signals → size up (confidence is high)
+        - In volatile markets → size down (uncertainty is high)
+
+        Uses the ratio of current window vol to baseline (cross-window) vol.
+        If current vol is 2x the baseline, scalar = 0.5 (half Kelly).
+        If current vol is 0.5x the baseline, scalar = 1.5 (capped).
+
+        This is standard risk parity / inverse-vol weighting used by
+        institutional quant funds (Bridgewater, AQR, etc).
+
+        Returns:
+            Scalar between vol_sizing_floor and vol_sizing_ceiling
+        """
+        if not self._vol_sizing_enabled:
+            return 1.0
+
+        current_vol: float = self.volatility
+        if current_vol < 1e-10:
+            return 1.0  # no vol data, neutral sizing
+
+        # Baseline vol from cross-window history
+        if len(self._vol_history) < 10:
+            return 1.0  # insufficient baseline, neutral sizing
+
+        baseline_vol: float = float(np.std(list(self._vol_history)))
+        if baseline_vol < 1e-10:
+            return 1.0
+
+        # Inverse vol ratio: high current vol → lower scalar
+        ratio: float = baseline_vol / current_vol
+        return max(self._vol_sizing_floor, min(ratio, self._vol_sizing_ceiling))
+
+    def compute_spread_z(self, true_prob: float, implied_prob: float) -> float:
+        """Compute z-score of current spread vs rolling spread history.
+
+        Tracks the raw spread (true_prob - implied_prob) over time.
+        When the current spread is far from its rolling mean, it's
+        likely to mean-revert — which means our directional bet has
+        a statistical tailwind.
+
+        High spread_z (>1.5): spread is abnormally wide → mean reversion
+        likely → boost confidence / position size.
+        Low spread_z (<0.5): spread is normal → no extra conviction.
+
+        This captures the well-documented mean reversion in prediction
+        market mispricings (Wolfers & Zitzewitz 2004).
+
+        Args:
+            true_prob: Our Bayesian estimate
+            implied_prob: Market's estimate from CLOB
+
+        Returns:
+            Z-score of current spread. Always >= 0 (absolute value).
+        """
+        if not self._mean_reversion_enabled:
+            return 0.0
+
+        spread: float = true_prob - implied_prob
+        self._spread_history.append(spread)
+
+        if len(self._spread_history) < 20:
+            return 0.0  # insufficient history
+
+        spreads: np.ndarray = np.array(self._spread_history)
+        mean: float = float(np.mean(spreads))
+        std: float = float(np.std(spreads))
+
+        if std < 1e-10:
+            return 0.0
+
+        return abs((spread - mean) / std)
 
     def _monte_carlo(
         self, current_price: float, remaining_seconds: float, direction: str
@@ -514,6 +776,14 @@ class BayesianModel:
         if edge < active_min_edge:
             return None
 
+        # Gate 2: Multi-timeframe momentum confirmation
+        # Requires at least mtf_min_agreement (default 66%) of EMA timeframes
+        # to agree with the proposed direction. This filters counter-trend
+        # noise that the Bayesian model might pick up from 2-3 lucky ticks.
+        mtf_agreement: float = self.compute_mtf_agreement(direction)
+        if mtf_agreement < self._mtf_min_agreement:
+            return None
+
         # Z-score with dynamic liquidity adjustment
         # Thin order books → factor > 1 → lower z_score → harder to trade
         # Thick order books → factor < 1 → higher z_score → edge more reliable
@@ -522,7 +792,7 @@ class BayesianModel:
             directional_true, directional_implied, liquidity_factor
         )
 
-        # Gate 2: Monte Carlo validation
+        # Gate 3: Monte Carlo validation
         # Even if the instantaneous edge looks good, simulate 1000 paths
         # to check if the edge survives price evolution over remaining time
         mc_ev: float
@@ -532,7 +802,7 @@ class BayesianModel:
             current_price, remaining_seconds, direction
         )
 
-        # Gate 3: MC expected value must be positive
+        # Gate 4: MC expected value must be positive
         # This filters out edges that look good statically but get eroded
         # by volatility over the remaining window
         if mc_ev <= 0:
@@ -547,6 +817,22 @@ class BayesianModel:
 
         kelly: float = self._kelly_fraction(mc_win_prob, payout_ratio)
 
+        # --- Advanced sizing adjustments ---
+
+        # Volatility-adjusted sizing: scale Kelly by inverse vol ratio.
+        # High vol → smaller size, low vol → larger size.
+        vol_scalar: float = self.compute_vol_scalar()
+        kelly *= vol_scalar
+
+        # Mean reversion detection: if spread is abnormally wide, boost.
+        # The spread is likely to narrow, giving our direction extra tailwind.
+        spread_z: float = self.compute_spread_z(directional_true, directional_implied)
+        if spread_z >= self._mr_z_threshold:
+            kelly *= self._mr_boost
+
+        # Final Kelly clamp after all adjustments
+        kelly = max(0.0, min(kelly, 1.0))
+
         elapsed_ms: float = (time.perf_counter() - start) * 1000
 
         return Signal(
@@ -560,6 +846,9 @@ class BayesianModel:
             mc_variance=mc_variance,
             kelly_fraction=kelly,
             computation_ms=elapsed_ms,
+            mtf_agreement=mtf_agreement,
+            vol_scalar=vol_scalar,
+            spread_z=spread_z,
         )
 
     def check_market_making_opportunity(

@@ -122,6 +122,32 @@ class Config:
     # increases fill probability and captures rebates on each.
     low_vol_threshold: float = 0.0005
 
+    # --- Multi-Timeframe Momentum ---
+    # EMA spans (in ticks) for multi-timeframe confirmation.
+    # Fast (~30s), medium (~1.5m), slow (~5m) at ~1 tick/3sec.
+    mtf_fast_span: int = 10       # ~30 seconds of ticks
+    mtf_medium_span: int = 30     # ~1.5 minutes
+    mtf_slow_span: int = 100      # ~5 minutes (full window)
+    # Minimum agreement score (0-1) across timeframes to confirm signal.
+    # 1.0 = all three must agree. 0.66 = at least 2 of 3.
+    mtf_min_agreement: float = 0.66
+
+    # --- Volatility-Adjusted Sizing ---
+    # Scale Kelly fraction by inverse normalized volatility.
+    # High vol → smaller size (uncertainty), low vol + signal → bigger size.
+    vol_sizing_enabled: bool = True
+    vol_sizing_lookback: int = 50   # ticks for baseline vol estimation
+    vol_sizing_floor: float = 0.3   # minimum scaling factor (never below 30% of Kelly)
+    vol_sizing_ceiling: float = 1.5  # maximum scaling factor (cap at 150% of Kelly)
+
+    # --- Mean Reversion Detection ---
+    # Detect when model-vs-market spread is abnormally wide (opportunity)
+    # or narrow (noise). Uses rolling z-score of the spread history.
+    mean_reversion_enabled: bool = True
+    spread_history_maxlen: int = 200  # rolling window for spread z-score
+    mean_reversion_z_threshold: float = 1.5  # spread z > this = mean reversion opportunity
+    mean_reversion_boost: float = 1.3  # multiply Kelly by this when MR detected
+
     # --- Performance Tuning (performance.py) ---
     # Exponential decay factor for Bayesian tick weighting.
     # 0.9 means each tick older than the newest is weighted 10% less.

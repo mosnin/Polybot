@@ -351,12 +351,12 @@ def simulate_window(
     if signal is None:
         return None
 
-    # Determine actual outcome from remaining ticks
+    # Determine actual outcome: Polymarket resolves vs window OPEN price
     exit_price: float = window_ticks[-1]["price"]
     if signal.direction == "UP":
-        won: bool = exit_price > current_price
+        won: bool = exit_price > open_price
     else:
-        won = exit_price < current_price
+        won = exit_price < open_price
 
     return {
         "timestamp": window_ticks[eval_idx - 1]["timestamp"],

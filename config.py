@@ -154,8 +154,9 @@ class Config:
     mtf_medium_span: int = 30     # ~1.5 minutes
     mtf_slow_span: int = 60       # ~3 minutes — initializes within 80% of window
     # Minimum agreement score (0-1) across timeframes to confirm signal.
-    # 0.66 = at least 2 of 3 timeframes must agree with direction.
-    mtf_min_agreement: float = 0.66
+    # 0.0 = disabled. Edge comes from CLOB lag (current vs lagged price),
+    # not momentum — MTF blocks contrarian trades where the edge is highest.
+    mtf_min_agreement: float = 0.0
 
     # --- Volatility-Adjusted Sizing ---
     # Scale Kelly fraction by inverse normalized volatility.

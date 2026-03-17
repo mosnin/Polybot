@@ -270,37 +270,30 @@ def slice_into_windows(
 # ---------------------------------------------------------------------------
 
 
-def _synthesize_implied_prob(
-    lagged_price: float,
-    open_price: float,
-    volatility: float,
-    remaining_seconds: float,
-) -> float:
-    """Synthesize an implied probability using analytical GBM from a lagged price.
+# Sensitivity: how much a 1% BTC move shifts probability from 0.5.
+# 50 means a 0.1% move → 5% prob shift (e.g., 0.50 → 0.55).
+# Realistic for 5-min Polymarket markets where uncertainty is high.
+_PROB_SENSITIVITY: float = 50.0
 
-    Models the CLOB as seeing a slightly stale price (lagged by ~10 ticks).
-    Uses the same analytical formula as the model's true probability, but
-    with the lagged price instead of current price.  The edge comes from
-    the bot seeing the current price before the CLOB catches up — a realistic
-    ~10-second information advantage.
+
+def _price_to_prob(price: float, open_price: float) -> float:
+    """Convert a BTC price to P(close > open) using linear mapping.
+
+    Simple, robust formula that doesn't depend on per-tick volatility
+    (which is unreliable with synthetic ticks from interpolated candles).
 
     Args:
-        lagged_price: BTC price from CLOB_LAG ticks ago (CLOB's view)
-        open_price: Price at window open
-        volatility: Per-tick volatility from model
-        remaining_seconds: Seconds until window close
+        price: BTC price to evaluate
+        open_price: Window open price
 
     Returns:
-        Synthetic implied probability of UP outcome (0.05 to 0.95)
+        Probability clamped to [0.15, 0.85]
     """
-    if open_price <= 0 or volatility < 1e-10 or remaining_seconds <= 0:
+    if open_price <= 0:
         return 0.5
-    vol_scaled: float = volatility * math.sqrt(remaining_seconds)
-    if vol_scaled < 1e-10:
-        return 0.5
-    log_ratio: float = math.log(lagged_price / open_price) / vol_scaled
-    prob: float = 0.5 * (1.0 + math.erf(log_ratio / math.sqrt(2.0)))
-    return max(0.05, min(0.95, prob))
+    move_pct: float = (price - open_price) / open_price
+    prob: float = 0.5 + move_pct * _PROB_SENSITIVITY
+    return max(0.15, min(0.85, prob))
 
 
 def simulate_window(
@@ -345,14 +338,10 @@ def simulate_window(
 
     # Synthesize implied probability from a LAGGED price (models CLOB delay).
     # The bot's edge comes from seeing current price ~30s before the CLOB updates.
-    # 30 ticks ≈ 30 seconds, realistic for Polymarket CLOB refresh latency.
     CLOB_LAG: int = 30
     lagged_idx: int = max(0, eval_idx - 1 - CLOB_LAG)
     lagged_price: float = window_ticks[lagged_idx]["price"]
-    volatility: float = model.volatility
-    implied_prob_up: float = _synthesize_implied_prob(
-        lagged_price, open_price, volatility, max(remaining_seconds, 10.0)
-    )
+    implied_prob_up: float = _price_to_prob(lagged_price, open_price)
 
     # Run full evaluation pipeline (no order_book → conservative defaults)
     signal = model.evaluate(

@@ -277,20 +277,24 @@ def _synthesize_implied_prob(current_price: float, open_price: float) -> float:
     This reflects the real-world dynamic where the CLOB midpoint tracks
     recent price action with a lag — exactly the edge the bot exploits.
 
-    Formula: ``0.5 + (current - open) / open * 10``, clamped to [0.4, 0.6]
+    Formula: ``0.5 + (current - open) / open * 5``, clamped to [0.45, 0.55]
+
+    The multiplier (5x) and tighter clamp model a lagging CLOB that partially
+    tracks price action — creating realistic edge windows for the Bayesian
+    model to exploit without overreacting to noise.
 
     Args:
         current_price: Current BTC price at evaluation point
         open_price: Price at window open
 
     Returns:
-        Synthetic implied probability of UP outcome (0.4 to 0.6)
+        Synthetic implied probability of UP outcome (0.45 to 0.55)
     """
     if open_price <= 0:
         return 0.5
     move_pct: float = (current_price - open_price) / open_price
-    implied: float = 0.5 + move_pct * 10.0
-    return max(0.4, min(0.6, implied))
+    implied: float = 0.5 + move_pct * 5.0
+    return max(0.45, min(0.55, implied))
 
 
 def simulate_window(

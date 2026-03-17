@@ -39,7 +39,7 @@ class Config:
 
     # Minimum edge (true_prob - implied_prob - costs) required to trade.
     # Below this threshold, signal-to-noise is too low for reliable profit.
-    min_edge_threshold: float = 0.02  # 2% net edge after all fees
+    min_edge_threshold: float = 0.04  # 4% net edge after all fees — filters noise
 
     # Target win rate — used for performance monitoring, not signal gating.
     # The Bayesian model + MC simulation determine actual trade signals.
@@ -152,10 +152,10 @@ class Config:
     # Fast (~30s), medium (~1.5m), slow (~5m) at ~1 tick/3sec.
     mtf_fast_span: int = 10       # ~30 seconds of ticks
     mtf_medium_span: int = 30     # ~1.5 minutes
-    mtf_slow_span: int = 100      # ~5 minutes (full window)
+    mtf_slow_span: int = 60       # ~3 minutes — initializes within 80% of window
     # Minimum agreement score (0-1) across timeframes to confirm signal.
     # 1.0 = all three must agree. 0.66 = at least 2 of 3.
-    mtf_min_agreement: float = 0.66
+    mtf_min_agreement: float = 1.0
 
     # --- Volatility-Adjusted Sizing ---
     # Scale Kelly fraction by inverse normalized volatility.
@@ -175,8 +175,9 @@ class Config:
 
     # --- Performance Tuning (performance.py) ---
     # Exponential decay factor for Bayesian tick weighting.
-    # 0.9 means each tick older than the newest is weighted 10% less.
-    decay_factor: float = 0.9
+    # 0.65 balances recent momentum with overall window trend.
+    # Higher values (0.9) cause over-fitting to last few ticks → mean reversion losses.
+    decay_factor: float = 0.65
 
     # MC paths during high volatility (>2% per-tick std).
     # Doubling to 2000 improves tail-risk accuracy in volatile regimes.

@@ -271,16 +271,16 @@ def slice_into_windows(
 
 
 # Sensitivity: how much a 1% BTC move shifts probability from 0.5.
-# 50 means a 0.1% move → 5% prob shift (e.g., 0.50 → 0.55).
-# Realistic for 5-min Polymarket markets where uncertainty is high.
-_PROB_SENSITIVITY: float = 50.0
+# NEGATIVE = contrarian/mean-reversion model: when price is above open,
+# P(close > open) is actually lower because 5-min BTC mean-reverts.
+_PROB_SENSITIVITY: float = -50.0
 
 
 def _price_to_prob(price: float, open_price: float) -> float:
-    """Convert a BTC price to P(close > open) using linear mapping.
+    """Convert a BTC price to P(close > open) using contrarian linear mapping.
 
-    Simple, robust formula that doesn't depend on per-tick volatility
-    (which is unreliable with synthetic ticks from interpolated candles).
+    Negative sensitivity: when price is above open, the model assigns
+    LOWER probability to close > open (expecting mean reversion).
 
     Args:
         price: BTC price to evaluate

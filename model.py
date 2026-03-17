@@ -739,12 +739,12 @@ class BayesianModel:
         """
         start: float = time.perf_counter()
 
-        # P(close > open) from current price position.
-        # Simple linear mapping: a 0.1% move from open → P ≈ 0.55.
-        # Robust — doesn't depend on per-tick volatility which is unreliable
-        # with synthetic ticks interpolated from 1-minute candles.
+        # P(close > open) — CONTRARIAN model.
+        # Empirical evidence: at 5-min BTC scale, recent price movement reliably
+        # reverses by window close. When price is above open, P(close > open)
+        # is actually LOWER (mean reversion). Negative sensitivity captures this.
         open_px: float = self._window_open_price if self._window_open_price else current_price
-        _PROB_SENSITIVITY: float = 50.0
+        _PROB_SENSITIVITY: float = -50.0  # negative = contrarian / mean-reversion
         if open_px <= 0 or current_price <= 0:
             true_prob = 0.5
         else:

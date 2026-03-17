@@ -122,6 +122,31 @@ class Config:
     # increases fill probability and captures rebates on each.
     low_vol_threshold: float = 0.0005
 
+    # --- Resolution Sniper ---
+    # Late-window strategy: in the last N seconds, BTC direction is nearly decided.
+    # The CLOB still has shares at 0.70-0.85 when they should be 0.95+.
+    # We buy near-certain outcomes at a discount. This is the highest win-rate edge.
+    sniper_enabled: bool = True
+    sniper_window_secs: float = 60.0      # activate in last 60 seconds of window
+    sniper_min_confidence: float = 0.80    # minimum P(direction) from Bayesian model
+    sniper_min_price_discount: float = 0.05  # only buy if CLOB price is 5%+ below our estimate
+    sniper_max_exposure_pct: float = 0.20  # can go bigger on high-confidence snipes (20%)
+    sniper_min_ticks: int = 15             # need at least 15 ticks of data before sniping
+
+    # --- Window Selector ---
+    # Not all 5-min windows have edge. Filter for high-volatility sessions where
+    # Polymarket lags hardest. Skip dead zones where spreads are tight and edge is noise.
+    window_selector_enabled: bool = True
+    # High-edge hours (UTC). These correspond to major market opens and overlap periods:
+    # 8-10 = London open, 13-16 = US open + overlap, 0-2 = Asia session open
+    high_edge_hours_utc: str = "0,1,2,8,9,10,13,14,15,16"
+    # Minimum per-tick volatility to trade outside high-edge hours.
+    # During "dead" hours, only trade if vol is spiking (news event, flash crash).
+    min_vol_for_off_hours: float = 0.005   # 0.5% per-tick vol = something is happening
+    # Minimum BTC price change (%) since window open to consider the window tradeable.
+    # Flat windows = no directional edge to capture.
+    min_window_move_pct: float = 0.03      # 0.03% = ~$20 on $67k BTC
+
     # --- Multi-Timeframe Momentum ---
     # EMA spans (in ticks) for multi-timeframe confirmation.
     # Fast (~30s), medium (~1.5m), slow (~5m) at ~1 tick/3sec.

@@ -982,9 +982,16 @@ class AsyncBot:
 
             remaining: float = self.current_market.end_timestamp - time.time()
 
-            # Step 3: Don't enter too close to expiry — insufficient time
-            # for maker fill + price movement to realize the edge
-            if remaining < self.config.min_remaining_window_secs:
+            # Determine if we're in sniper territory (last N seconds).
+            # Sniper overrides the normal min_remaining guard because it's
+            # specifically designed for late-window high-confidence entries.
+            in_sniper_window: bool = (
+                self.config.sniper_enabled
+                and 0 < remaining <= self.config.sniper_window_secs
+            )
+
+            # Step 3: Don't enter too close to expiry — unless sniping
+            if remaining < self.config.min_remaining_window_secs and not in_sniper_window:
                 continue
 
             # Step 4: Safety checks
@@ -1054,6 +1061,131 @@ class AsyncBot:
             if mm_triggered:
                 cycle_ms = (time.perf_counter() - cycle_start) * 1000
                 signal = None  # no directional signal on MM cycles
+
+            # --- Resolution Sniper: highest priority after MM ---
+            # In the last 60s of a window, switch to sniper mode.
+            # Bypasses normal signal pipeline for faster, higher-conviction entries.
+            if in_sniper_window and not mm_triggered:
+                try:
+                    token_id_for_fetch = self.current_market.yes_token_id
+                    snipe_mid, snipe_book = await asyncio.gather(
+                        loop.run_in_executor(
+                            None, self.executor.get_midpoint, token_id_for_fetch,
+                        ),
+                        loop.run_in_executor(
+                            None, self.executor.get_order_book, token_id_for_fetch,
+                        ),
+                    )
+                    snipe_mid = float(snipe_mid)
+                    self._consecutive_api_failures = 0
+                except Exception as e:
+                    self.logger.warning(f"Sniper fetch failed: {e}")
+                    self._consecutive_api_failures += 1
+                    snipe_mid = None
+                    snipe_book = None
+
+                if snipe_mid is not None:
+                    signal = self.model.evaluate_snipe(
+                        current_price=tick.last_price,
+                        implied_prob_up=snipe_mid,
+                        remaining_seconds=remaining,
+                        order_book=snipe_book,
+                        sniper_min_confidence=self.config.sniper_min_confidence,
+                        sniper_min_price_discount=self.config.sniper_min_price_discount,
+                        sniper_max_exposure_pct=self.config.sniper_max_exposure_pct,
+                        sniper_min_ticks=self.config.sniper_min_ticks,
+                    )
+
+                    if signal:
+                        cycle_ms = (time.perf_counter() - cycle_start) * 1000
+
+                        if signal.direction == "UP":
+                            token_id = self.current_market.yes_token_id
+                        else:
+                            token_id = self.current_market.no_token_id
+
+                        if self.state.test_mode:
+                            self.logger.info(
+                                f"[SNIPER] {signal.direction} | "
+                                f"conf={signal.true_prob:.1%} | "
+                                f"clob={signal.implied_prob:.2f} | "
+                                f"edge={signal.edge:.4f} | "
+                                f"remaining={remaining:.0f}s"
+                            )
+                            self.state.total_trades += 1
+                        else:
+                            snipe_result = await loop.run_in_executor(
+                                None,
+                                self.executor.place_maker_limit,
+                                token_id,
+                                signal.direction,
+                                signal.kelly_fraction,
+                                snipe_mid,
+                                self.config.sniper_max_exposure_pct,
+                                None,  # no balance cap for sniper
+                                None,  # no Stoikov for sniper (speed > precision)
+                            )
+
+                            if snipe_result:
+                                self.state.total_trades += 1
+                                self._pending_prediction = {
+                                    "direction": signal.direction,
+                                    "entry_price": tick.last_price,
+                                }
+                                self._update_rebate_tracker(snipe_result)
+                                self._update_compounding()
+                                self._push_event({
+                                    "type": "trade",
+                                    "timestamp": time.time(),
+                                    "direction": f"SNIPE-{signal.direction}",
+                                    "edge": signal.edge,
+                                    "z_score": signal.z_score,
+                                    "model_prob": signal.true_prob,
+                                    "implied_prob": signal.implied_prob,
+                                    "kelly_fraction": signal.kelly_fraction,
+                                    "fill_price": snipe_result.price,
+                                    "size": snipe_result.size,
+                                    "mc_ev": signal.mc_ev,
+                                    "outcome": None,
+                                    "gas_paid": self.config.gas_buffer_usdc,
+                                    "net_pnl": None,
+                                    "mtf_agreement": 1.0,
+                                    "vol_scalar": 1.0,
+                                    "spread_z": 0.0,
+                                })
+
+                        # Print sniper status
+                        table = self._build_status_table(signal, cycle_ms)
+                        self.console.print(table)
+                        self.cycle_times.append(cycle_ms)
+                        self._save_equity_to_redis()
+                        continue  # sniper handled this tick
+
+            # --- Window Quality Check ---
+            # Before running the full directional pipeline, check if this window
+            # is worth trading. Skip dead zones to preserve capital for high-edge windows.
+            if self.config.window_selector_enabled and not mm_triggered and not in_sniper_window:
+                import datetime as _dt
+                current_hour_utc: int = _dt.datetime.utcnow().hour
+                high_edge_hours: list = [
+                    int(h.strip())
+                    for h in self.config.high_edge_hours_utc.split(",")
+                    if h.strip().isdigit()
+                ]
+                window_quality: dict = self.model.check_window_quality(
+                    current_hour_utc=current_hour_utc,
+                    high_edge_hours=high_edge_hours,
+                    min_vol_for_off_hours=self.config.min_vol_for_off_hours,
+                    min_window_move_pct=self.config.min_window_move_pct,
+                )
+                if not window_quality["tradeable"]:
+                    # Log once per window (use tick_count as proxy)
+                    if self.model.tick_count == 20:
+                        self.logger.info(
+                            f"Window skipped: {window_quality['reason']} "
+                            f"(quality={window_quality['quality_score']:.2f})"
+                        )
+                    continue
 
             # Directional as tie-breaker: only fire when MM didn't find opportunity
             # for 3+ consecutive checks (MM is the primary strategy)
@@ -1294,6 +1426,18 @@ class AsyncBot:
         self.logger.info(f"  Min Edge: {self.config.min_edge_threshold}")
         self.logger.info(f"  Max Exposure: {self.config.max_exposure_pct:.0%}")
         self.logger.info(f"  Drawdown Stop: {self.config.drawdown_hard_stop_pct:.0%}")
+        self.logger.info(f"  Sniper: {'ON' if self.config.sniper_enabled else 'OFF'} "
+                         f"(last {self.config.sniper_window_secs:.0f}s, "
+                         f"min conf {self.config.sniper_min_confidence:.0%})")
+        self.logger.info(f"  Window Selector: {'ON' if self.config.window_selector_enabled else 'OFF'} "
+                         f"(hours: {self.config.high_edge_hours_utc})")
+        self.logger.info(f"  MTF Momentum: agreement >= {self.config.mtf_min_agreement:.0%}")
+        self.logger.info(f"  Vol Sizing: {'ON' if self.config.vol_sizing_enabled else 'OFF'} "
+                         f"(floor={self.config.vol_sizing_floor:.1f}x, "
+                         f"ceil={self.config.vol_sizing_ceiling:.1f}x)")
+        self.logger.info(f"  Mean Reversion: {'ON' if self.config.mean_reversion_enabled else 'OFF'} "
+                         f"(z>{self.config.mean_reversion_z_threshold}, "
+                         f"boost={self.config.mean_reversion_boost:.1f}x)")
         self.logger.info("=" * 60)
 
         # Initialize starting balance

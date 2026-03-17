@@ -851,6 +851,211 @@ class BayesianModel:
             spread_z=spread_z,
         )
 
+    def evaluate_snipe(
+        self,
+        current_price: float,
+        implied_prob_up: float,
+        remaining_seconds: float,
+        order_book: Optional[dict] = None,
+        sniper_min_confidence: float = 0.80,
+        sniper_min_price_discount: float = 0.05,
+        sniper_max_exposure_pct: float = 0.20,
+        sniper_min_ticks: int = 15,
+    ) -> Optional[Signal]:
+        """Resolution sniper: high-confidence late-window entries.
+
+        In the last 30-60 seconds of a 5-min window, the BTC price direction
+        is essentially decided. A stock that's been trending up for 4 minutes
+        is overwhelmingly likely to finish up. But the CLOB still has shares
+        priced at 0.70-0.85 because retail participants:
+        1. Aren't watching (it's a 5-min market, attention is fleeting)
+        2. Are scared of the short time left (they see risk, we see certainty)
+        3. Have stale limit orders sitting from earlier in the window
+
+        This is not a prediction — it's collecting the gap between reality
+        and the market's delayed pricing of near-certain outcomes.
+
+        The sniper bypasses the full evaluate() pipeline (MC, MTF) because
+        at <60s remaining, those gates add noise, not signal. We only need:
+        1. Strong Bayesian posterior (>80% confidence from tick history)
+        2. CLOB price meaningfully below our estimate (>5% discount)
+
+        Win rate target: 85%+. This is the bot's highest-conviction strategy.
+
+        Args:
+            current_price: Latest BTC price
+            implied_prob_up: CLOB midpoint of UP token
+            remaining_seconds: Seconds until window resolution
+            order_book: Optional CLOB order book for liquidity check
+            sniper_min_confidence: Minimum Bayesian P(direction) to snipe
+            sniper_min_price_discount: Minimum gap between our prob and CLOB price
+            sniper_max_exposure_pct: Max exposure for sniper (higher = more aggressive)
+            sniper_min_ticks: Minimum tick count before sniping
+
+        Returns:
+            Signal if snipe opportunity found, None otherwise
+        """
+        start: float = time.perf_counter()
+
+        # Need enough data to have a reliable posterior
+        if self.tick_count < sniper_min_ticks:
+            return None
+
+        true_prob: float = self.true_prob_up
+
+        # Determine direction and confidence
+        if true_prob >= 0.5:
+            direction: str = "UP"
+            confidence: float = true_prob
+            clob_price: float = implied_prob_up
+        else:
+            direction = "DOWN"
+            confidence = 1.0 - true_prob
+            clob_price = 1.0 - implied_prob_up
+
+        # Gate 1: confidence must be high
+        if confidence < sniper_min_confidence:
+            return None
+
+        # Gate 2: CLOB must be underpricing this outcome
+        discount: float = confidence - clob_price
+        if discount < sniper_min_price_discount:
+            return None
+
+        # Gate 3: liquidity check — don't snipe into an empty book
+        if order_book is not None:
+            liquidity_factor: float = self._compute_liquidity_factor(order_book)
+            if liquidity_factor >= 1.4:  # very thin book
+                return None
+
+        # Compute edge and Kelly for the snipe
+        edge: float = discount - self.round_trip_cost
+
+        if edge <= 0:
+            return None
+
+        # Simple Kelly for near-certain bets
+        # Payout ratio for binary: (1 - clob_price) / clob_price
+        if clob_price > 0.01:
+            payout_ratio: float = (1.0 - clob_price) / clob_price
+        else:
+            payout_ratio = 1.0
+
+        kelly: float = self._kelly_fraction(confidence, payout_ratio)
+
+        # Sniper can size bigger since conviction is higher
+        kelly = min(kelly, 1.0)
+
+        elapsed_ms: float = (time.perf_counter() - start) * 1000
+
+        return Signal(
+            direction=direction,
+            true_prob=confidence,
+            implied_prob=clob_price,
+            edge=edge,
+            z_score=discount / max(self.volatility, 1e-6),  # simplified z
+            mc_ev=edge,  # skip MC, edge IS the EV at this point
+            mc_win_prob=confidence,
+            mc_variance=0.0,
+            kelly_fraction=kelly,
+            computation_ms=elapsed_ms,
+            mtf_agreement=1.0,  # MTF not used for sniper
+            vol_scalar=1.0,     # no vol adjustment for sniper
+            spread_z=0.0,
+        )
+
+    def check_window_quality(
+        self,
+        current_hour_utc: int,
+        high_edge_hours: List[int],
+        min_vol_for_off_hours: float = 0.005,
+        min_window_move_pct: float = 0.03,
+    ) -> dict:
+        """Evaluate whether the current window is worth trading.
+
+        Not all 5-minute windows have edge. This filter identifies:
+        1. High-edge hours (major market opens, overlap sessions)
+        2. Volatility spikes (news events during dead hours)
+        3. Sufficient price movement (flat = no directional edge)
+
+        Returns a quality assessment that the trade loop uses to decide
+        whether to engage or sit out.
+
+        Args:
+            current_hour_utc: Current hour in UTC (0-23)
+            high_edge_hours: List of UTC hours considered high-edge
+            min_vol_for_off_hours: Minimum vol to trade during off-hours
+            min_window_move_pct: Minimum price change since window open
+
+        Returns:
+            Dict with:
+                tradeable: bool — should we trade this window?
+                reason: str — why or why not
+                quality_score: float — 0.0 to 1.0 quality rating
+        """
+        is_high_edge_hour: bool = current_hour_utc in high_edge_hours
+        current_vol: float = self.volatility
+        has_vol_spike: bool = current_vol >= min_vol_for_off_hours
+
+        # Check if price has moved enough since window open
+        has_movement: bool = False
+        if len(self.price_history) >= 2:
+            first_price: float = self.price_history[0]
+            last_price: float = self.price_history[-1]
+            if first_price > 0:
+                move_pct: float = abs(last_price - first_price) / first_price
+                has_movement = move_pct >= min_window_move_pct
+            else:
+                has_movement = False
+
+        # Quality scoring
+        score: float = 0.0
+
+        # Session quality (0.0 - 0.4)
+        if is_high_edge_hour:
+            score += 0.4
+        elif has_vol_spike:
+            score += 0.2  # off-hours but something is happening
+
+        # Volatility quality (0.0 - 0.3)
+        if current_vol > 0.01:
+            score += 0.3  # high vol = wider mispricings
+        elif current_vol > 0.003:
+            score += 0.15
+
+        # Movement quality (0.0 - 0.3)
+        if has_movement:
+            score += 0.3
+
+        # Decision logic
+        if is_high_edge_hour and has_movement:
+            return {
+                "tradeable": True,
+                "reason": "high-edge hour with price movement",
+                "quality_score": score,
+            }
+
+        if has_vol_spike and has_movement:
+            return {
+                "tradeable": True,
+                "reason": f"vol spike ({current_vol:.4f}) during off-hours",
+                "quality_score": score,
+            }
+
+        if is_high_edge_hour and not has_movement:
+            return {
+                "tradeable": False,
+                "reason": "high-edge hour but flat price — no directional edge",
+                "quality_score": score,
+            }
+
+        return {
+            "tradeable": False,
+            "reason": f"off-hours (hour={current_hour_utc}), "
+                      f"vol={current_vol:.6f}, no movement",
+            "quality_score": score,
+        }
+
     def check_market_making_opportunity(
         self,
         yes_midpoint: float,

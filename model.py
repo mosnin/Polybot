@@ -26,11 +26,9 @@ import numpy as np
 
 from performance import apply_decay_weights, get_dynamic_mc_paths
 
-# Redis is optional — model works without it, but loses state persistence
-try:
-    import redis as _redis_lib
-except ImportError:
-    _redis_lib = None  # type: ignore[assignment]
+# Memory store is optional — model works without it, but loses state persistence
+# Import MemoryStore lazily to avoid circular imports
+_memory_store = None  # set externally by bot.py
 
 
 @dataclass
@@ -98,7 +96,7 @@ class BayesianModel:
         self,
         min_edge: float = 0.02,
         round_trip_cost: float = 0.003,
-        redis_url: Optional[str] = None,
+        memory_store=None,
         decay_factor: float = 0.9,
         mtf_fast_span: int = 10,
         mtf_medium_span: int = 30,
@@ -121,8 +119,8 @@ class BayesianModel:
             round_trip_cost: Total cost of entering + exiting position.
                              0.3% assumes worst-case taker fees both sides.
                              Maker fills reduce this, creating hidden alpha.
-            redis_url: Optional Redis URL for state persistence across restarts.
-                       If None or redis-py not installed, persistence is disabled.
+            memory_store: Optional MemoryStore for SQLite state persistence.
+                          If None, persistence is disabled.
             decay_factor: Exponential decay for tick weighting (0.9 = 10% decay).
                           Recent ticks are weighted heavier in alpha/beta computation.
             mtf_fast_span: Fast EMA span in ticks (~30s).
@@ -157,6 +155,9 @@ class BayesianModel:
         self.tick_count: int = 0
         self.logger: logging.Logger = logging.getLogger("Model")
 
+        # SQLite memory store for state persistence (replaces Redis)
+        self._memory = memory_store
+
         # --- Multi-Timeframe Momentum (EMA-based) ---
         # Three EMA windows capture momentum at different time scales.
         # When all agree on direction, signal confidence is highest.
@@ -186,22 +187,8 @@ class BayesianModel:
         self._mr_z_threshold: float = mean_reversion_z_threshold
         self._mr_boost: float = mean_reversion_boost
 
-        # Redis connection for Bayesian state persistence (optional).
-        # Sub-1ms SET on localhost — no impact on 80ms cycle budget.
-        self._redis = None
-        if _redis_lib is not None and redis_url:
-            try:
-                self._redis = _redis_lib.Redis.from_url(
-                    redis_url, socket_connect_timeout=1, socket_timeout=1
-                )
-                self._redis.ping()
-                self.logger.info("Redis connected for model state persistence")
-            except Exception as e:
-                self.logger.warning(f"Redis unavailable, persistence disabled: {e}")
-                self._redis = None
-
-        # Restore state from Redis if available (silent no-op if Redis is down)
-        self._load_from_redis()
+        # Restore state from SQLite if available
+        self._load_state()
 
     def reset(self) -> None:
         """Reset to uninformative prior for new market window.
@@ -224,7 +211,7 @@ class BayesianModel:
         self._ema_fast = None
         self._ema_medium = None
         self._ema_slow = None
-        self._save_to_redis()
+        self._save_state()
 
     def update(self, current_price: float, previous_price: Optional[float]) -> None:
         """Bayesian update on a new price observation.
@@ -273,7 +260,7 @@ class BayesianModel:
             list(self.tick_directions), self.decay_factor
         )
 
-        self._save_to_redis()
+        self._save_state()
 
     def _update_ema(self, price: float) -> None:
         """Update all three EMA timeframes with new price.
@@ -297,100 +284,81 @@ class BayesianModel:
                 alpha = 2.0 / (span + 1)
                 setattr(self, attr, alpha * price + (1.0 - alpha) * current)
 
-    def _save_to_redis(self) -> None:
-        """Persist current Bayesian state to Redis.
+    def _save_state(self) -> None:
+        """Persist Bayesian state + cross-window state to SQLite.
 
-        Called after every update() and reset(). Synchronous but fast —
-        localhost SET with ~200-byte payload completes in <0.5ms.
-        Fails silently so the model always continues operating.
-
-        Saves cross-window state (vol_history, spread_history) separately
-        so they survive both window resets and process restarts.
+        Called after every update() and reset(). SQLite WAL mode writes
+        in ~0.1ms — faster than Redis over TCP for our payload sizes.
+        Cross-window state saved every 10th tick to reduce write frequency.
         """
-        if self._redis is None:
+        if self._memory is None:
             return
         try:
-            state: str = json.dumps({
+            self._memory.set("model_state", {
                 "alpha": self.alpha,
                 "beta": self.beta,
                 "price_history": list(self.price_history),
                 "tick_directions": list(self.tick_directions),
                 "tick_count": self.tick_count,
             })
-            self._redis.set("polybot:model_state", state)
-            # Cross-window state saved less frequently (every 10th tick)
-            # to avoid bloating Redis writes on every tick
+            # Cross-window state saved less frequently
             if self.tick_count % 10 == 0:
-                cross_window: str = json.dumps({
+                self._memory.set("model_cross_window", {
                     "vol_history": list(self._vol_history),
                     "spread_history": list(self._spread_history),
                     "ema_fast": self._ema_fast,
                     "ema_medium": self._ema_medium,
                     "ema_slow": self._ema_slow,
                 })
-                self._redis.set("polybot:model_cross_window", cross_window)
         except Exception:
-            pass  # never block the trading loop for persistence
+            pass  # never block the trading loop
 
-    def _load_from_redis(self) -> None:
-        """Restore Bayesian state from Redis on startup.
-
-        If Redis has prior state, the model resumes with accumulated
-        evidence instead of starting from an uninformative prior.
-        This preserves winning edge continuity across process restarts.
-
-        Also restores cross-window state (vol_history, spread_history)
-        so volatility baseline and mean reversion context survive restarts.
-        Fails silently — uses default uninformative prior on any error.
-        """
-        if self._redis is None:
+    def _load_state(self) -> None:
+        """Restore Bayesian + cross-window state from SQLite on startup."""
+        if self._memory is None:
             return
-        try:
-            raw = self._redis.get("polybot:model_state")
-            if raw is None:
-                return
-            data: dict = json.loads(raw)
-            self.alpha = float(data["alpha"])
-            self.beta = float(data["beta"])
-            self.price_history = deque(
-                data["price_history"], maxlen=self.VOLATILITY_WINDOW
-            )
-            self.tick_directions = deque(
-                data.get("tick_directions", []), maxlen=self.VOLATILITY_WINDOW
-            )
-            self.tick_count = int(data["tick_count"])
-            self.logger.info(
-                f"Restored model state from Redis "
-                f"(alpha={self.alpha:.1f}, beta={self.beta:.1f}, ticks={self.tick_count})"
-            )
-        except Exception as e:
-            self.logger.warning(f"Could not load Redis state: {e}")
 
-        # Restore cross-window state separately
-        try:
-            raw_cw = self._redis.get("polybot:model_cross_window")
-            if raw_cw is None:
-                return
-            cw: dict = json.loads(raw_cw)
-            self._vol_history = deque(
-                cw.get("vol_history", []), maxlen=self._vol_sizing_lookback
-            )
-            self._spread_history = deque(
-                cw.get("spread_history", []), maxlen=self._spread_history.maxlen
-            )
-            if cw.get("ema_fast") is not None:
-                self._ema_fast = float(cw["ema_fast"])
-            if cw.get("ema_medium") is not None:
-                self._ema_medium = float(cw["ema_medium"])
-            if cw.get("ema_slow") is not None:
-                self._ema_slow = float(cw["ema_slow"])
-            self.logger.info(
-                f"Restored cross-window state from Redis "
-                f"(vol_pts={len(self._vol_history)}, "
-                f"spread_pts={len(self._spread_history)})"
-            )
-        except Exception as e:
-            self.logger.warning(f"Could not load cross-window state: {e}")
+        data = self._memory.get("model_state")
+        if data is not None:
+            try:
+                self.alpha = float(data["alpha"])
+                self.beta = float(data["beta"])
+                self.price_history = deque(
+                    data["price_history"], maxlen=self.VOLATILITY_WINDOW
+                )
+                self.tick_directions = deque(
+                    data.get("tick_directions", []), maxlen=self.VOLATILITY_WINDOW
+                )
+                self.tick_count = int(data["tick_count"])
+                self.logger.info(
+                    f"Restored model state "
+                    f"(alpha={self.alpha:.1f}, beta={self.beta:.1f}, ticks={self.tick_count})"
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not load model state: {e}")
+
+        cw = self._memory.get("model_cross_window")
+        if cw is not None:
+            try:
+                self._vol_history = deque(
+                    cw.get("vol_history", []), maxlen=self._vol_sizing_lookback
+                )
+                self._spread_history = deque(
+                    cw.get("spread_history", []), maxlen=self._spread_history.maxlen
+                )
+                if cw.get("ema_fast") is not None:
+                    self._ema_fast = float(cw["ema_fast"])
+                if cw.get("ema_medium") is not None:
+                    self._ema_medium = float(cw["ema_medium"])
+                if cw.get("ema_slow") is not None:
+                    self._ema_slow = float(cw["ema_slow"])
+                self.logger.info(
+                    f"Restored cross-window state "
+                    f"(vol_pts={len(self._vol_history)}, "
+                    f"spread_pts={len(self._spread_history)})"
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not load cross-window state: {e}")
 
     @property
     def true_prob_up(self) -> float:

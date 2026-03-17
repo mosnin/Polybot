@@ -43,14 +43,9 @@ from rich.table import Table
 from config import Config, load_config
 from data_feed import OKXWebSocket, GammaMarketFinder, MarketWindow, PriceTick
 from executor import OrderExecutor, OrderResult
+from memory import MemoryStore, RegimeState
 from model import BayesianModel, Signal
 from performance import LatencyMonitor, adaptive_z_score, rebate_optimizer
-
-# Redis is optional — bot works without it, but loses equity history persistence
-try:
-    import redis as _redis_lib
-except ImportError:
-    _redis_lib = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -127,13 +122,18 @@ class AsyncBot:
         self.tick_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self.market_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
 
+        # SQLite memory store — replaces Redis. Zero daemon, zero config, zero RAM.
+        # Must be initialized before model so model can use it for persistence.
+        self.memory: MemoryStore = MemoryStore()
+        self.memory.cleanup_old_data(days=7)
+
         # Component initialization
         self.okx: OKXWebSocket = OKXWebSocket(self.tick_queue)
         self.gamma: GammaMarketFinder = GammaMarketFinder(self.market_queue)
         self.model: BayesianModel = BayesianModel(
             min_edge=config.min_edge_threshold,
             round_trip_cost=config.round_trip_cost_pct,
-            redis_url=config.redis_url,
+            memory_store=self.memory,
             decay_factor=config.decay_factor,
             mtf_fast_span=config.mtf_fast_span,
             mtf_medium_span=config.mtf_medium_span,
@@ -198,22 +198,15 @@ class AsyncBot:
         self._last_stoikov_check: float = 0.0
         self._stoikov_state: Optional[dict] = None
 
-        # Redis connection for equity history + bot state persistence (optional).
-        # Shares the same Redis URL as the model for state continuity across restarts.
-        self._redis = None
-        self._redis_save_interval: float = 10.0  # seconds between equity saves
-        self._last_redis_save: float = 0.0
-        if _redis_lib is not None and config.redis_url:
-            try:
-                self._redis = _redis_lib.Redis.from_url(
-                    config.redis_url, socket_connect_timeout=1, socket_timeout=1
-                )
-                self._redis.ping()
-                self.logger.info("Redis connected for equity history persistence")
-                self._load_equity_from_redis()
-            except Exception as e:
-                self.logger.warning(f"Redis unavailable for equity: {e}")
-                self._redis = None
+        self._save_interval: float = 10.0  # seconds between state saves
+        self._last_save: float = 0.0
+
+        # Load regime state from historical window data.
+        # This is the cross-window intelligence — survives restarts.
+        self.regime: RegimeState = self.memory.load_regime_state()
+
+        # Restore bot state from SQLite
+        self._load_state_from_memory()
 
     # --- Safety Controls ---
 
@@ -420,52 +413,33 @@ class AsyncBot:
             except Exception:
                 pass  # never block the bot for dashboard updates
 
-    def _save_equity_to_redis(self) -> None:
-        """Persist equity history and bot state to Redis.
+    def _save_state_to_memory(self) -> None:
+        """Persist bot state to SQLite.
 
-        Throttled to every 10 seconds to avoid Redis overhead on every tick.
-        Saves: equity_history, wins, losses, consecutive_losses, total_trades,
-        peak_balance, daily_maker_volume, compounding_active.
-
-        Fails silently — never blocks the trading loop for persistence.
+        Throttled to every 10 seconds. SQLite WAL mode writes in ~0.1ms
+        — faster than Redis over TCP for our payload sizes.
         """
-        if self._redis is None:
-            return
         now: float = time.time()
-        if now - self._last_redis_save < self._redis_save_interval:
+        if now - self._last_save < self._save_interval:
+            return
+        self.memory.set("bot_state", {
+            "equity_history": list(self.state.equity_history)[-5000:],  # last 5k only
+            "wins": self.state.wins,
+            "losses": self.state.losses,
+            "consecutive_losses": self.state.consecutive_losses,
+            "total_trades": self.state.total_trades,
+            "peak_balance": self.state.peak_balance,
+            "daily_maker_volume": self.state.daily_maker_volume,
+            "compounding_active": self.state.compounding_active,
+        })
+        self._last_save = now
+
+    def _load_state_from_memory(self) -> None:
+        """Restore bot state from SQLite on startup."""
+        data = self.memory.get("bot_state")
+        if data is None:
             return
         try:
-            import json
-            state: str = json.dumps({
-                "equity_history": list(self.state.equity_history),
-                "wins": self.state.wins,
-                "losses": self.state.losses,
-                "consecutive_losses": self.state.consecutive_losses,
-                "total_trades": self.state.total_trades,
-                "peak_balance": self.state.peak_balance,
-                "daily_maker_volume": self.state.daily_maker_volume,
-                "compounding_active": self.state.compounding_active,
-            })
-            self._redis.set("polybot:bot_state", state)
-            self._last_redis_save = now
-        except Exception:
-            pass  # never block the trading loop for persistence
-
-    def _load_equity_from_redis(self) -> None:
-        """Restore equity history and bot state from Redis on startup.
-
-        Ensures zero edge history loss across restarts — the compounding
-        gate, drawdown tracking, and daily return calculation all resume
-        from where they left off.
-        """
-        if self._redis is None:
-            return
-        try:
-            import json
-            raw = self._redis.get("polybot:bot_state")
-            if raw is None:
-                return
-            data: dict = json.loads(raw)
             loaded_history = data.get("equity_history", [])
             self.state.equity_history = deque(
                 [(ts, bal) for ts, bal in loaded_history], maxlen=50000
@@ -478,13 +452,13 @@ class AsyncBot:
             self.state.daily_maker_volume = float(data.get("daily_maker_volume", 0.0))
             self.state.compounding_active = bool(data.get("compounding_active", False))
             self.logger.info(
-                f"Restored bot state from Redis "
+                f"Restored bot state from SQLite "
                 f"(trades={self.state.total_trades}, "
                 f"wins={self.state.wins}, "
                 f"equity_points={len(self.state.equity_history)})"
             )
         except Exception as e:
-            self.logger.warning(f"Could not load Redis bot state: {e}")
+            self.logger.warning(f"Could not load bot state: {e}")
 
     def _poll_controls(self) -> None:
         """Non-blocking poll for dashboard control commands.
@@ -602,6 +576,20 @@ class AsyncBot:
         else:
             table.add_row("Market", "Waiting for window...")
 
+        # Regime info
+        table.add_row("---", "--- Regime ---")
+        table.add_row("Regime", f"{self.regime.regime} ({self.regime.regime_strength:.2f})")
+        table.add_row(
+            "Sniper WR",
+            f"{self.regime.sniper_win_rate:.0%} "
+            f"({self.regime.sniper_wins}/{self.regime.sniper_attempts})",
+        )
+        table.add_row(
+            "Direction WR",
+            f"{self.regime.directional_win_rate:.0%} "
+            f"({self.regime.directional_wins}/{self.regime.directional_attempts})",
+        )
+
         # Mode indicator
         if self.state.test_mode:
             table.add_row("MODE", "[bold red]TEST (no real orders)[/bold red]")
@@ -634,25 +622,68 @@ class AsyncBot:
                 else:
                     won = not price_went_up
 
+                outcome_str: str = "win" if won else "loss"
+                strategy: str = pred.get("strategy", "directional")
+
                 if won:
                     self.state.wins += 1
                     self.state.consecutive_losses = 0
-                    self.logger.info("Previous window outcome: WIN")
+                    self.logger.info(f"Previous window outcome: WIN ({strategy})")
                 else:
                     self.state.losses += 1
                     self.state.consecutive_losses += 1
                     self.logger.info(
-                        f"Previous window outcome: LOSS "
+                        f"Previous window outcome: LOSS ({strategy}) "
                         f"(streak={self.state.consecutive_losses})"
                     )
+
+                # Update regime strategy tracking
+                if strategy == "sniper":
+                    self.regime.sniper_attempts += 1
+                    if won:
+                        self.regime.sniper_wins += 1
+                elif strategy == "directional":
+                    self.regime.directional_attempts += 1
+                    if won:
+                        self.regime.directional_wins += 1
+                elif strategy == "mm":
+                    self.regime.mm_attempts += 1
+                    if won:
+                        self.regime.mm_wins += 1
+
+                # Log trade outcome to SQLite
+                prev_slug = self.current_market.slug if self.current_market else ""
+                self.memory.update_trade_outcome(prev_slug, outcome_str)
+
                 self._pending_prediction = None
+
+            # Log the resolved window for regime analysis
+            if self.current_market is not None and self.last_price is not None:
+                if len(self.model.price_history) >= 2:
+                    first_p = self.model.price_history[0]
+                    last_p = self.model.price_history[-1]
+                    win_direction = "UP" if last_p > first_p else "DOWN"
+                    magnitude = abs(last_p - first_p) / first_p if first_p > 0 else 0.0
+                    self.regime.recent_directions.append(win_direction)
+                    self.regime.recent_magnitudes.append(magnitude)
+                    self.regime.classify_regime()
+                    self.memory.log_window(
+                        slug=self.current_market.slug,
+                        direction=win_direction,
+                        magnitude=magnitude,
+                        volatility=self.model.volatility,
+                        regime=self.regime.regime,
+                    )
 
             self.current_market = market
             self.model.reset()
             self.last_price = None
             self.logger.info(
                 f"New market window: {market.slug} "
-                f"(ends in {market.end_timestamp - time.time():.0f}s)"
+                f"(ends in {market.end_timestamp - time.time():.0f}s) "
+                f"[regime={self.regime.regime} "
+                f"str={self.regime.regime_strength:.2f} "
+                f"sniper={self.regime.sniper_wins}/{self.regime.sniper_attempts}]"
             )
 
     async def _stale_order_loop(self) -> None:
@@ -1085,12 +1116,16 @@ class AsyncBot:
                     snipe_book = None
 
                 if snipe_mid is not None:
+                    # Use regime-adaptive confidence threshold
+                    adaptive_conf: float = self.regime.get_adaptive_sniper_confidence(
+                        self.config.sniper_min_confidence
+                    )
                     signal = self.model.evaluate_snipe(
                         current_price=tick.last_price,
                         implied_prob_up=snipe_mid,
                         remaining_seconds=remaining,
                         order_book=snipe_book,
-                        sniper_min_confidence=self.config.sniper_min_confidence,
+                        sniper_min_confidence=adaptive_conf,
                         sniper_min_price_discount=self.config.sniper_min_price_discount,
                         sniper_max_exposure_pct=self.config.sniper_max_exposure_pct,
                         sniper_min_ticks=self.config.sniper_min_ticks,
@@ -1131,7 +1166,17 @@ class AsyncBot:
                                 self._pending_prediction = {
                                     "direction": signal.direction,
                                     "entry_price": tick.last_price,
+                                    "strategy": "sniper",
                                 }
+                                # Log sniper trade to SQLite
+                                self.memory.log_trade(
+                                    strategy="sniper",
+                                    direction=signal.direction,
+                                    edge=signal.edge,
+                                    kelly=signal.kelly_fraction,
+                                    regime=self.regime.regime,
+                                    window_slug=self.current_market.slug if self.current_market else "",
+                                )
                                 self._update_rebate_tracker(snipe_result)
                                 self._update_compounding()
                                 self._push_event({
@@ -1158,7 +1203,7 @@ class AsyncBot:
                         table = self._build_status_table(signal, cycle_ms)
                         self.console.print(table)
                         self.cycle_times.append(cycle_ms)
-                        self._save_equity_to_redis()
+                        self._save_state_to_memory()
                         continue  # sniper handled this tick
 
             # --- Window Quality Check ---
@@ -1225,10 +1270,14 @@ class AsyncBot:
                         )
                     continue
 
-                # Step 6: Compute adaptive min-edge based on real-time CLOB depth.
+                # Step 6: Compute adaptive min-edge based on CLOB depth + regime.
+                # Regime adjusts the base: trending = lower bar, ranging = higher bar.
+                regime_adjusted_edge: float = self.regime.get_adaptive_edge_threshold(
+                    self.config.min_edge_threshold
+                )
                 dynamic_min_edge: float = adaptive_z_score(
                     order_book,
-                    base_min_edge=self.config.min_edge_threshold,
+                    base_min_edge=regime_adjusted_edge,
                     high_depth_threshold=self.config.rebate_depth_threshold,
                 )
 
@@ -1279,7 +1328,18 @@ class AsyncBot:
                         self._pending_prediction = {
                             "direction": signal.direction,
                             "entry_price": tick.last_price,
+                            "strategy": "directional",
                         }
+
+                        # Log directional trade to SQLite
+                        self.memory.log_trade(
+                            strategy="directional",
+                            direction=signal.direction,
+                            edge=signal.edge,
+                            kelly=signal.kelly_fraction,
+                            regime=self.regime.regime,
+                            window_slug=self.current_market.slug if self.current_market else "",
+                        )
 
                         rebate_cfg: dict = rebate_optimizer(
                             order_book,
@@ -1382,7 +1442,7 @@ class AsyncBot:
             self.cycle_times.append(cycle_ms)
 
             # Step 10: Persist equity history to Redis (throttled to every 10s)
-            self._save_equity_to_redis()
+            self._save_state_to_memory()
 
             # Push status snapshot to dashboard
             self._push_event({
@@ -1475,6 +1535,10 @@ class AsyncBot:
             await self.okx.close()
             await self.gamma.close()
             self.executor.cancel_all()
+            # Force-save state before exit
+            self._last_save = 0.0  # reset throttle
+            self._save_state_to_memory()
+            self.memory.close()
 
             # Final stats
             self.logger.info("=" * 60)

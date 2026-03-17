@@ -368,7 +368,7 @@ def simulate_window(
         "kelly_fraction": signal.kelly_fraction,
         "entry_price": current_price,
         "exit_price": exit_price,
-        "implied_prob": implied_prob_up,
+        "implied_prob": signal.implied_prob,  # directional token price paid
         "won": won,
     }
 
@@ -461,10 +461,16 @@ def _compute_backtest_metrics(
         position_size = min(position_size, available)
         position_size = max(position_size, 0.0)
 
+        # Binary market P&L: buy token at implied_prob, pays $1 on win, $0 on loss.
+        # Win:  profit = position_size * (1 - implied_prob) / implied_prob - fees
+        # Loss: loss   = position_size (entire stake lost) + fees
+        implied: float = trade.get("implied_prob", 0.5)
+        implied = max(implied, 0.01)  # avoid division by zero
+
         if trade["won"]:
-            pnl: float = position_size * trade["edge"]
+            pnl: float = position_size * ((1.0 - implied) / implied) - position_size * config.round_trip_cost_pct
         else:
-            pnl = -position_size * config.round_trip_cost_pct
+            pnl = -position_size - position_size * config.round_trip_cost_pct
 
         pnl -= config.gas_buffer_usdc
 

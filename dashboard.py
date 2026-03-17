@@ -202,7 +202,8 @@ def render_equity_curve(equity_curve: List[Tuple[float, float]]) -> plt.Figure:
         return fig
 
     timestamps: List[datetime.datetime] = [
-        datetime.datetime.fromtimestamp(ts) for ts, _ in equity_curve
+        datetime.datetime.fromtimestamp(ts / 1000.0 if ts > 1e12 else ts)
+        for ts, _ in equity_curve
     ]
     balances: List[float] = [b for _, b in equity_curve]
 
@@ -461,6 +462,7 @@ def _render_backtest_tab() -> None:
 
     # --- Metric Cards ---
     st.markdown("---")
+    n_days: int = result.get("n_days", 30)
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Total Trades", f"{result.get('total_trades', 0):,}")
@@ -469,12 +471,12 @@ def _render_backtest_tab() -> None:
         st.metric("Win Rate", f"{result.get('win_rate', 0):.1%}")
         st.metric("Avg Edge", f"{result.get('avg_edge', 0):.4f}")
     with col3:
-        st.metric("Sharpe Ratio", f"{result.get('sharpe_ratio', 0):.2f}")
+        st.metric(f"{n_days}-Day Sharpe", f"{result.get('period_sharpe', 0):.2f}")
         st.metric("Max Drawdown", f"{result.get('max_drawdown', 0):.1%}")
 
     col4, col5, col6 = st.columns(3)
     with col4:
-        st.metric("Net Return", f"{result.get('net_return', 0):.1%}")
+        st.metric(f"{n_days}-Day Return", f"{result.get('monthly_return', result.get('net_return', 0)):.1%}")
     with col5:
         st.metric("Final Balance", f"${result.get('final_balance', 0):.2f}")
     with col6:

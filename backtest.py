@@ -519,6 +519,15 @@ def _compute_backtest_metrics(
         sum(daily_returns) / len(daily_returns) if daily_returns else 0.0
     )
 
+    # Period-specific metrics (for the actual backtest window, not annualized)
+    n_days: int = max(len(daily_returns), 1)
+    period_sharpe: float = (
+        float(np.mean(daily_returns) / np.std(daily_returns, ddof=1) * np.sqrt(n_days))
+        if len(daily_returns) >= 2 and float(np.std(daily_returns, ddof=1)) > 1e-10
+        else 0.0
+    )
+    monthly_return: float = net_return  # net return over the backtest period
+
     alert_win_rate: bool = win_rate < 0.58
     alert_expectancy: bool = daily_expectancy < 0.008
 
@@ -530,11 +539,14 @@ def _compute_backtest_metrics(
         "win_rate": win_rate,
         "avg_edge": avg_edge,
         "sharpe_ratio": sharpe,
+        "period_sharpe": period_sharpe,
         "max_drawdown": max_dd,
         "net_return": net_return,
+        "monthly_return": monthly_return,
         "final_balance": balance,
         "daily_expectancy": daily_expectancy,
         "avg_kelly": avg_kelly,
+        "n_days": n_days,
         "trades": sized_trades,
         "equity_curve": equity_curve,
         "alert_win_rate": alert_win_rate,
@@ -1147,8 +1159,9 @@ async def _cli_main() -> None:
     elapsed: float = time.time() - start_time
 
     # Print summary
+    n_days: int = result.get("n_days", 30)
     print("\n" + "=" * 60)
-    print("  BACKTEST RESULTS")
+    print(f"  BACKTEST RESULTS ({n_days}-day period)")
     print("=" * 60)
     print(f"  Completed in:           {elapsed:.1f}s")
     print(f"  Total Windows Analyzed: {result['total_windows']:,}")
@@ -1157,9 +1170,10 @@ async def _cli_main() -> None:
     print(f"  Win Rate:               {result['win_rate']:.1%}")
     print(f"  Average Edge:           {result['avg_edge']:.4f}")
     print(f"  Average Kelly:          {result['avg_kelly']:.3f}")
-    print(f"  Sharpe Ratio:           {result['sharpe_ratio']:.2f}")
+    print(f"  {n_days}-Day Sharpe:          {result['period_sharpe']:.2f}")
+    print(f"  Annualized Sharpe:      {result['sharpe_ratio']:.2f}")
     print(f"  Max Drawdown:           {result['max_drawdown']:.1%}")
-    print(f"  Net Return:             {result['net_return']:.1%}")
+    print(f"  {n_days}-Day Return:         {result['monthly_return']:.1%}")
     print(f"  Final Balance:          ${result['final_balance']:.2f}")
     print(f"  Daily Expectancy:       {result['daily_expectancy']:.2%}")
     print("=" * 60)

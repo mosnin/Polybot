@@ -144,6 +144,9 @@ class BayesianModel:
         self.round_trip_cost: float = round_trip_cost
         self.decay_factor: float = decay_factor
 
+        # Window open price — set on first tick, used for directional tracking
+        self._window_open_price: Optional[float] = None
+
         # Rolling price history for volatility calculation.
         # Deque with maxlen auto-evicts old observations.
         self.price_history: Deque[float] = deque(maxlen=self.VOLATILITY_WINDOW)
@@ -207,6 +210,7 @@ class BayesianModel:
         self.price_history.clear()
         self.tick_directions.clear()
         self.tick_count = 0
+        self._window_open_price = None
         # Reset EMAs (each window starts fresh for momentum)
         self._ema_fast = None
         self._ema_medium = None
@@ -239,12 +243,20 @@ class BayesianModel:
         # where alpha = 2 / (span + 1)
         self._update_ema(current_price)
 
+        # Record window open price on first tick
+        if self._window_open_price is None:
+            self._window_open_price = current_price
+
         if previous_price is None:
             return  # first tick — no direction to observe
 
-        if current_price > previous_price:
+        # Track position relative to window OPEN, not tick-to-tick momentum.
+        # This directly matches Polymarket resolution: "is BTC above/below open?"
+        # Tick-to-tick momentum caused mean-reversion losses because the model
+        # detected micro-spikes that reliably reversed.
+        if current_price > self._window_open_price:
             self.tick_directions.append(1)
-        elif current_price < previous_price:
+        elif current_price < self._window_open_price:
             self.tick_directions.append(-1)
         else:
             self.tick_directions.append(0)
